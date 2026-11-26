@@ -473,6 +473,7 @@ id table, the error handling — are in [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 | `enroll-retry-scan` | nothing arrived within 30 s — press the key and hold it for ~2 s; the stage is simply repeated |
 | `enroll-finger-not-centered` / `enroll-remove-and-retry` | the press was empty or identical to a previous one; lift the finger and place it slightly differently |
 | enrolment ends with "the sensor stopped answering" | the imaging engine wedged mid-enrolment and three handshake attempts failed; un- and rebind the device or replug the keyboard, then enrol again |
+| `enroll-disconnected` although the keyboard is still there | fprintd reports every device error that way; look at `journalctl -u fprintd`. "Device disabled to prevent overheating" was libfprint's temperature model and is fixed (`temp_hot_seconds = -1`) |
 | `verify`/`enroll` fails with "please delete it and enrol again" | the stored template predates this driver or came from another sensor — `fprintd-delete "$USER"` and enrol again |
 
 Useful debugging: `fpc-capture -vv`, and `sudo modprobe usbmon` +

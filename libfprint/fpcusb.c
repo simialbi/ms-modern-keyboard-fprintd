@@ -1443,6 +1443,18 @@ fpi_device_fpcusb_class_init (FpiDeviceFpcUsbClass *klass)
    * collects many frames. */
   dev_class->nr_enroll_stages = FPCUSB_ENROLL_STAGES;
 
+  /*
+   * libfprint's temperature model assumes a sensor heats up while it is
+   * active and refuses to work with FP_DEVICE_ERROR_TOO_HOT ("Device
+   * disabled to prevent overheating", which fprintd reports as
+   * enroll-disconnected).  A sixteen-stage enrolment of a press sensor
+   * easily exceeds the default budget, while this sensor only images
+   * for a few hundred milliseconds per press and is idle in between, so
+   * it has no thermal budget to track - like every other non-image
+   * driver here.
+   */
+  dev_class->temp_hot_seconds = -1;
+
   dev_class->open = fpcusb_open;
   dev_class->close = fpcusb_close;
   dev_class->enroll = fpcusb_enroll;
