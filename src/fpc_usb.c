@@ -392,15 +392,16 @@ int fpc_status(fpc_dev *d, uint16_t *value)
 	return FPC_OK;
 }
 
-int fpc_abort(fpc_dev *d, unsigned timeout_ms)
+/*
+ * Tell the firmware to drop a pending GET_IMAGE.  Used both by
+ * fpc_abort() and before every poll attempt, so it must not touch the
+ * cancel flag - that one means "the caller wants to stop".
+ */
+static int abort_cmd(fpc_dev *d, unsigned timeout_ms)
 {
 	uint8_t f[10];
 	int r;
 
-	if (!d)
-		return FPC_ERR_PARAM;
-
-	d->cancel = 1;
 	d->seq++;
 	r = send_cmd(d, FPC_CMD_ABORT);
 	if (r < 0)
@@ -415,6 +416,15 @@ int fpc_abort(fpc_dev *d, unsigned timeout_ms)
 			? FPC_OK : FPC_ERR_PROTO;
 }
 
+int fpc_abort(fpc_dev *d, unsigned timeout_ms)
+{
+	if (!d)
+		return FPC_ERR_PARAM;
+
+	d->cancel = 1;
+	return abort_cmd(d, timeout_ms);
+}
+
 /*
  * One image transfer.
  *
@@ -422,23 +432,20 @@ int fpc_abort(fpc_dev *d, unsigned timeout_ms)
  * chopped into 64 byte USB packets.  The first packet carries the frame
  * header (opcode, status, length) directly; every following packet repeats
  * a two byte tag that has to be stripped before the payload is appended.
+ *
+ * The firmware answers a GET_IMAGE only when a finger is already on the
+ * sensor when the command arrives; it takes about 300 ms to scan.  A
+ * request that is sent while the sensor is free is *not* completed when
+ * the user touches later, it is simply never answered - which is why
+ * fpc_capture() polls with short attempts instead of waiting forever.
  */
-int fpc_capture(fpc_dev *d, uint8_t *img, size_t len, unsigned timeout_ms)
+static int capture_once(fpc_dev *d, uint8_t *img, size_t len,
+			unsigned timeout_ms)
 {
 	size_t total, off, remaining;
 	uint8_t pkt[FPC_USB_PACKET];
 	uint8_t *frame;
 	int r;
-
-	if (!d || !img || len < FPC_USB_PACKET)
-		return FPC_ERR_PARAM;
-
-	d->cancel = 0;
-
-	/* Cancel a transfer that may still be pending in the firmware. */
-	fpc_abort(d, 500);
-	d->cancel = 0;
-	msleep(15);
 
 	total = len + 12;
 	frame = malloc(total);
@@ -492,7 +499,9 @@ int fpc_capture(fpc_dev *d, uint8_t *img, size_t len, unsigned timeout_ms)
 		if (want > FPC_USB_PACKET)
 			want = FPC_USB_PACKET;
 
-		r = bulk_in(d, pkt, (int)want, timeout_ms ? timeout_ms : 5000);
+		/* The frame is on the wire now, give it time to arrive. */
+		r = bulk_in(d, pkt, (int)want,
+			    timeout_ms > 5000 ? timeout_ms : 5000);
 		if (r < 0)
 			goto out;
 		if (r < 3)
@@ -521,6 +530,95 @@ int fpc_capture(fpc_dev *d, uint8_t *img, size_t len, unsigned timeout_ms)
 out:
 	free(frame);
 	return r;
+}
+
+/*
+ * Poll the sensor until it hands out an image.
+ *
+ * Every attempt is a fresh ABORT + GET_IMAGE pair with a short deadline:
+ * if a finger is on the sensor the image arrives within roughly 300 ms,
+ * otherwise the attempt expires and the next one is sent.  Without this
+ * the first GET_IMAGE after a touch returns the image of the *previous*
+ * touch, which made every verification compare the wrong frame.
+ */
+int fpc_capture(fpc_dev *d, uint8_t *img, size_t len, unsigned timeout_ms)
+{
+	unsigned waited = 0;
+	int r;
+
+	if (!d || !img || len < FPC_USB_PACKET)
+		return FPC_ERR_PARAM;
+
+	d->cancel = 0;
+
+	for (;;) {
+		/*
+		 * Keep the gap between two attempts short, a touch that
+		 * falls into it is lost: only resynchronise when the
+		 * firmware did not answer the abort as expected.
+		 */
+		if (abort_cmd(d, 500) != FPC_OK)
+			drain(d);
+		if (d->cancel)
+			return FPC_ERR_ABORTED;
+		msleep(5);
+
+		r = capture_once(d, img, len, FPC_CAPTURE_ATTEMPT_MS);
+		if (r == FPC_OK)
+			return FPC_OK;
+		if (d->cancel)
+			return FPC_ERR_ABORTED;
+		if (r != FPC_ERR_TIMEOUT && r != FPC_ERR_ABORTED &&
+		    r != FPC_ERR_PROTO)
+			return r;
+
+		waited += FPC_CAPTURE_ATTEMPT_MS;
+		if (timeout_ms && waited >= timeout_ms)
+			return FPC_ERR_TIMEOUT;
+	}
+}
+
+/*
+ * Wait until the finger has been taken off the sensor again, so that the
+ * next capture belongs to a new touch instead of returning three almost
+ * identical frames of the one that is still resting on it.
+ */
+int fpc_wait_finger_off(fpc_dev *d, unsigned timeout_ms)
+{
+	unsigned waited = 0;
+	int quiet = 0;
+	uint8_t *img;
+	size_t len;
+
+	if (!d)
+		return FPC_ERR_PARAM;
+
+	len = (size_t)d->info.width * d->info.height;
+	if (!len)
+		return FPC_ERR_PARAM;
+	img = malloc(len);
+	if (!img)
+		return FPC_ERR_NOMEM;
+
+	d->cancel = 0;
+	while (quiet < FPC_FINGER_OFF_ATTEMPTS) {
+		int r;
+
+		if (abort_cmd(d, 500) != FPC_OK)
+			drain(d);
+		if (d->cancel)
+			break;
+		msleep(5);
+
+		r = capture_once(d, img, len, FPC_CAPTURE_ATTEMPT_MS);
+		quiet = (r == FPC_OK) ? 0 : quiet + 1;
+
+		waited += FPC_CAPTURE_ATTEMPT_MS;
+		if (timeout_ms && waited >= timeout_ms)
+			break;
+	}
+	free(img);
+	return FPC_OK;
 }
 
 const fpc_sensor_info *fpc_info(const fpc_dev *d)

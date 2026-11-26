@@ -57,6 +57,16 @@ extern "C" {
 /* Image resolution of every FPC sensor supported by the Windows driver. */
 #define FPC_IMAGE_DPI           508
 
+/* The firmware answers GET_IMAGE only when a finger is on the sensor at
+ * the moment the command arrives, and needs about 300 ms to scan it.  A
+ * capture is therefore a poll: one ABORT + GET_IMAGE attempt of this
+ * length after the other. */
+#define FPC_CAPTURE_ATTEMPT_MS  600
+
+/* How many attempts in a row have to come back empty before the finger
+ * counts as lifted. */
+#define FPC_FINGER_OFF_ATTEMPTS 2
+
 /* ------------------------------------------------------------------ */
 /* Errors                                                              */
 /* ------------------------------------------------------------------ */
@@ -104,7 +114,10 @@ void fpc_close(fpc_dev *dev);
  * called once after fpc_open() and after any fatal protocol error. */
 int  fpc_hello(fpc_dev *dev, fpc_sensor_info *info);
 
-/* Short status query (opcode 5).  Returns the raw 16-bit answer. */
+/* Short status query (opcode 5).  Returns the raw 16-bit answer.
+ *
+ * The FPC1022 firmware of the Modern Keyboard stalls this command, so it
+ * is kept for other sensors only - do not use it to detect a finger. */
 int  fpc_status(fpc_dev *dev, uint16_t *value);
 
 /* Cancel a pending capture.  Safe to call from another thread. */
@@ -112,9 +125,15 @@ int  fpc_abort(fpc_dev *dev, unsigned timeout_ms);
 
 /* Capture one image.  `buf` must hold width*height bytes (8 bit grey).
  *
- * timeout_ms == 0 blocks until the user touches the sensor; otherwise the
- * call returns FPC_ERR_TIMEOUT if no finger is presented in time. */
+ * The sensor is polled until it delivers a frame.  timeout_ms == 0 polls
+ * until the user touches the sensor; otherwise the call returns
+ * FPC_ERR_TIMEOUT if no finger is presented in time. */
 int  fpc_capture(fpc_dev *dev, uint8_t *buf, size_t len, unsigned timeout_ms);
+
+/* Wait until the sensor is free again.  A finger that keeps resting on it
+ * answers every GET_IMAGE, so without this two captures in a row return
+ * the same touch.  timeout_ms == 0 waits indefinitely. */
+int  fpc_wait_finger_off(fpc_dev *dev, unsigned timeout_ms);
 
 /* Accessors (valid after fpc_hello()). */
 const fpc_sensor_info *fpc_info(const fpc_dev *dev);

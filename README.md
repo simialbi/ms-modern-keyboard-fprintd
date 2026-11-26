@@ -40,7 +40,8 @@ driver for libfprint so that `fprintd`, GNOME/KDE settings, PAM login and
 | Sensor identification on hardware | **working** — FPC1022, hwid `0x0121`, 112 × 88 |
 | Live image capture on hardware | **working** — complete frame, CRC/id/sequence all valid, recognisable ridges |
 | libfprint driver | **working** — built into libfprint 1.94.100, `fprintd-enroll` completes on real hardware |
-| Matching quality | tuned for the small sensor, see [Matching quality](#matching-quality-verify-no-match) |
+| Matching quality | **unsolved** — libfprint's NBIS matcher cannot work on 112 × 88 frames, see [Matching quality](#matching-quality-verify-no-match) |
+| Capture reliability | **partly solved** — the sensor has to be polled; it still wedges after a few hundred cycles, see [`docs/PROTOCOL.md`](docs/PROTOCOL.md) §4.2 |
 
 Verified against a real keyboard (`045e:0815`, bcdDevice 1.13):
 
@@ -246,7 +247,12 @@ that is easy to misread:
 
 So a sensor that produces too few minutiae enrols perfectly and then
 reports `verify-no-match` forever, no matter how low the threshold is
-set.  To get over that hurdle the driver
+set.  **That is exactly what this sensor does**, and the measurement
+below says it cannot be fixed by preprocessing: ten real presses of one
+finger yield 0 to 2 minutiae each and every bozorth3 score is 0, at 1×,
+2× and 3× enlargement, with and without normalisation.
+
+The driver still does what can be done on the NBIS side:
 
 * stretches the histogram of every frame over the full grey range
   (`FPCUSB_CLIP`) — NBIS discards low contrast blocks, and the sensor
@@ -261,6 +267,33 @@ set.  To get over that hurdle the driver
 **After changing any of this, delete and redo the enrolment**
 (`fprintd-delete "$USER"`), because the stored templates were extracted
 with the old preprocessing.
+
+#### Why that is not enough (measured on real presses)
+
+The numbers further down were obtained from crops of libfprint's own
+reference print, which is a *full sized* scan reduced to this geometry —
+it flatters the sensor.  Ten presses captured from the real keyboard
+(one finger, `fpc-capture loop`) look like this:
+
+```
+variant                             min.med >=10 min. score.med     >=thr
+scale 1x raw        all minutiae          2      0/10         0    0/45
+scale 2x normalized all minutiae          2      0/10         0    0/45
+scale 3x normalized all minutiae          0      0/10         0    0/45
+```
+
+Not a single frame reaches the ten minutiae bozorth3 needs, so **every**
+score is 0 — including the comparison of a frame with itself.  No
+threshold, no enlargement and no contrast trick changes that: a
+5.6 × 4.4 mm window does not contain ten ridge endings.
+
+Matching this sensor therefore requires what the vendor algorithm does:
+compare the **images** (normalised cross correlation over shifts and
+small rotations) against *several* stored frames per finger.  Measured
+here: same finger, same spot → 0.97; different finger → ≤ 0.33; same
+finger but a different spot → 0.17, which is why a single template per
+finger cannot work.  That matcher is **not implemented yet**; until it
+is, `fprintd-verify` will keep reporting `verify-no-match`.
 
 The two knobs can be measured instead of guessed — `tools/fpc_bench.c`
 runs the very same NBIS extraction and bozorth3 matching over PGM files,
@@ -281,10 +314,12 @@ Pick the winning variant and set `FPCUSB_ENLARGE` / `bz3_threshold` in
 `./build/fpc-bench --scale 2 --normalize` prints the full score matrix
 and shows the impostor scores the threshold has to stay above.
 
-The defaults above come from such a measurement.  Four overlapping
-112 × 88 crops — the exact geometry of this sensor — of libfprint's own
-reference print (`examples/prints/loop-right.png`), plus one crop of a
-different area as an impostor:
+The NBIS defaults above come from such a measurement — on *synthetic*
+input, which is why they looked far better than the hardware turned out
+to be.  Four overlapping 112 × 88 crops — the exact geometry of this
+sensor — of libfprint's own reference print
+(`examples/prints/loop-right.png`), plus one crop of a different area as
+an impostor:
 
 ```
 variant                             min.med >=10 min. score.med     >=thr(20)
@@ -328,9 +363,10 @@ id table, the error handling — are in [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 | `open: USB I/O error` | no permission for `/dev/bus/usb/...`; install the udev rule or use `sudo` |
 | `open: interface busy` | another process (e.g. `fprintd`) holds the interface — stop it first |
 | `hello: protocol error` | the firmware is out of sync; unplug/replug the keyboard |
-| capture never returns | that is normal — it waits for a finger; press the fingerprint key |
+| capture never returns | it polls for a finger; press the fingerprint key and **hold it for ~2 s**, brief taps fall between two requests |
+| no image at all any more, `info` still works | the imaging engine is wedged — unplug and replug the keyboard; a USB reset does not help (see [`docs/PROTOCOL.md`](docs/PROTOCOL.md) §4.2) |
 | image looks like a negative | flip `FPI_IMAGE_COLORS_INVERTED` in the libfprint driver |
-| `fprintd-verify` always says `verify-no-match` | too few minutiae per image — see [Matching quality](#matching-quality-verify-no-match); re-enrol after every change of the preprocessing |
+| `fprintd-verify` always says `verify-no-match` | expected for now: the frames carry too few minutiae for NBIS at all — see [Matching quality](#matching-quality-verify-no-match) |
 
 Useful debugging: `fpc-capture -vv`, and `sudo modprobe usbmon` +
 `wireshark` on `usbmon1` to see the raw frames.

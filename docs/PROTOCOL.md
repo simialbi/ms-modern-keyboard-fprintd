@@ -148,7 +148,7 @@ confirms both the width/height assignment and the reassembly.
 
 ```
 host  -> 0x0007 id seq crc                     (8 bytes)
-   ... device blocks until a finger touches the sensor ...
+   ... ~300 ms later, *if* a finger was on the sensor already ...
 dev   -> packet 1 (64 bytes): 0x1007 status len <58 bytes of payload>
 dev   -> packet n (<=64 bytes): <2 byte tag> <up to 62 bytes of payload>
    ...
@@ -162,6 +162,36 @@ frame and is followed by the usual id/seq/CRC trailer.
 
 The last read is sized `min(remaining + 2, 64)`, which is why the final
 packet is usually short.
+
+**The firmware does not wait for a finger** (measured on the FPC1022 of
+the keyboard, 2025-11):
+
+* if a finger rests on the sensor when `GET_IMAGE` arrives, the first
+  packet appears after roughly 300 ms,
+* if the sensor is free, the command is simply *never* answered — not
+  with an error, not later when the user touches.  A transfer that was
+  submitted before the touch stays pending forever, and the next
+  `GET_IMAGE` then returns the image of the *previous* touch.
+
+Waiting for a finger is therefore a **poll**: `ABORT` + `GET_IMAGE` with
+a deadline of about 600 ms, over and over (`FPC_CAPTURE_ATTEMPT_MS`).
+Shorter attempts do not work - 350 ms missed every single touch in a
+test of ten.  A touch has to overlap the moment a request is sent, so
+brief taps are lost; about 80 % of touches held for ~2 s are caught.
+
+While a finger keeps resting, *every* attempt returns an image, which is
+how `fpc_wait_finger_off()` detects that the finger has been lifted: two
+attempts in a row without an image.
+
+**Known unsolved problem — the imaging engine wedges.**  After a few
+hundred poll cycles the sensor stops delivering images altogether: it
+still answers `HELLO` (`fpc-capture info` works), but every `GET_IMAGE`
+runs into its deadline, for any finger.  `libusb_reset_device()` does
+*not* recover it; only unplugging the keyboard does, and even then the
+next capture may be the last one for a while.  Whatever the Windows
+driver does to keep the engine alive (a calibration command among the
+undocumented opcodes `0x0002`-`0x0006`?) is still unknown, and this is
+the most likely reason for verifications failing in practice.
 
 ### 4.3 Cancelling
 
@@ -186,23 +216,33 @@ The Windows stack also contains:
   creation, and enrolment quality feedback.  On Linux this job is done by
   libfprint's own NBIS/bozorth3 pipeline, so it is not needed.
 
-  NBIS is not a free replacement though: it was designed for full sized
-  500 dpi prints, and bozorth3 scores a comparison with **0** as soon as
-  one of the two prints carries fewer than ten minutiae — which a
-  5.6 × 4.4 mm image easily undercuts.  The libfprint driver therefore
-  normalises the contrast and enlarges every frame before it hands it
-  over; `tools/fpc_bench.c` measures how many minutiae a given
-  preprocessing actually yields.
+  NBIS is **not** a free replacement though, and measurement says it
+  cannot be made one: it was designed for full sized 500 dpi prints, and
+  bozorth3 scores a comparison with **0** as soon as one of the two
+  prints carries fewer than ten minutiae.  Ten real presses of one finger
+  on this sensor (`tools/fpc_bench.c`) yield **0 to 2 minutiae each** and
+  **every** pairwise score is 0, with or without contrast normalisation
+  and at 1×, 2× and 3× enlargement.  A 5.6 × 4.4 mm window simply does
+  not contain ten ridge endings.
+
+  Matching such a sensor needs the approach the vendor algorithm uses:
+  comparing the *images* (normalised cross correlation over a search of
+  shifts and small rotations) against several stored frames per finger,
+  not minutiae.  Measured on this hardware, two presses hitting the same
+  spot correlate at 0.97 while a different finger stays at or below 0.33
+  — but two presses of the same finger that land on different spots can
+  drop to 0.17, so one template per finger is not enough.
 * A "secure"/match-on-chip path and firmware update commands.  Neither is
   used by the normal enrol/verify flow of this sensor: the firmware only
   streams raw images, the matching happens on the host in both worlds.
 
 ## 6. Notes for anyone extending this
 
-* The sensor does **not** provide a separate "finger present" interrupt.
-  Waiting for a finger is simply a `GET_IMAGE` whose answer is delayed,
-  which is why the libfprint driver submits that transfer without a
-  timeout and relies on `ABORT` for cancellation.
+* The sensor does **not** provide a separate "finger present" interrupt,
+  and `STATUS` (`0x0005`) is stalled by this firmware, so it cannot be
+  used for finger detection either.  Waiting for a finger means polling
+  `GET_IMAGE`, see 4.2 — a transfer submitted *before* the touch is never
+  completed, so the libfprint driver must not wait on a single one.
 * The HID keyboard interface (interface 0) is untouched — the keyboard
   keeps working with the normal `usbhid` driver while the sensor is in use.
 * Image polarity: ridges come out dark on this sensor, so the libfprint

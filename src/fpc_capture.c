@@ -106,10 +106,6 @@ int main(int argc, char **argv)
 	printf("version: %s\n", info.fw);
 
 	if (!strcmp(cmd, "info")) {
-		uint16_t st = 0;
-
-		if (fpc_status(dev, &st) == FPC_OK)
-			printf("status : 0x%04x\n", st);
 		fpc_close(dev);
 		return 0;
 	}
@@ -162,6 +158,10 @@ int main(int argc, char **argv)
 			snprintf(path, sizeof path, "%s%04d.pgm", arg, ++n);
 			if (write_pgm(path, img, info.width, info.height) == 0)
 				printf("wrote %s\n", path);
+
+			/* One image per touch: a resting finger answers
+			 * every request, so wait until it is lifted. */
+			fpc_wait_finger_off(dev, 10000);
 		}
 		r = 0;
 	} else {
