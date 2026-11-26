@@ -150,8 +150,6 @@ jobs:
     continue-on-error: true
     steps:
       - uses: actions/checkout@v4
-        with:
-          path: driver
 
       - name: Install libfprint build dependencies
         run: |
@@ -162,31 +160,12 @@ jobs:
             libcairo2-dev libgudev-1.0-dev libpixman-1-dev libnss3-dev \
             libopencv-dev gtk-doc-tools python3-cairo-dev valac
 
-      - name: Clone libfprint
-        run: git clone --depth 1 https://gitlab.freedesktop.org/libfprint/libfprint.git
+      # Exactly the same code path users run locally, minus the install step.
+      - name: Build libfprint with the fpcusb driver
+        run: ./libfprint/install.sh --build-only
 
-      - name: Add the fpcusb driver to the tree
+      - name: Check that the driver ended up in the library
         run: |
-          cp driver/libfprint/fpcusb.c driver/libfprint/fpcusb.h \
-             libfprint/libfprint/drivers/
-          python3 - <<'PY'
-          import re, pathlib
-          p = pathlib.Path('libfprint/libfprint/meson.build')
-          s = p.read_text()
-          if 'fpcusb' not in s:
-              # register the driver in the image-driver source list
-              s = s.replace("drivers_sources = [", "drivers_sources = [\n    'drivers/fpcusb.c',", 1)
-              p.write_text(s)
-          q = pathlib.Path('libfprint/meson_options.txt')
-          t = q.read_text()
-          if 'fpcusb' not in t:
-              t = re.sub(r"(choices:\s*\[)", r"\1'fpcusb', ", t, count=1)
-              q.write_text(t)
-          PY
-
-      - name: Configure and build
-        working-directory: libfprint
-        run: |
-          meson setup _build -Ddrivers=fpcusb -Dintrospection=false \
-            -Dgtk-examples=false -Ddoc=false
-          ninja -C _build
+          test -f build/libfprint/_build/libfprint/libfprint-2.so.2
+          grep -q "fpi_device_fpcusb_get_type" \
+            build/libfprint/_build/libfprint/fpi-drivers.c
