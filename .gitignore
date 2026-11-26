@@ -3,5 +3,8 @@ stage/
 *.o
 *.pgm
 
+# IntelliJ stuff
+.idea/
+
 # the Windows installer this driver was reverse engineered from
 *.exe
