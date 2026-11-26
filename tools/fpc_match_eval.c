@@ -36,9 +36,19 @@ typedef struct {
 	size_t capacity;
 } score_list;
 
+/* What a comparison reports: the correlation peak, how sharply it rises
+ * above the rest of the plane, or the product of the two. */
+enum {
+	SCORE_PEAK,
+	SCORE_SHARP,
+	SCORE_MIX,
+};
+
 static unsigned image_width;
 static unsigned image_height;
 static size_t image_size;
+static int score_mode = SCORE_PEAK;
+static double sharp_reference = FPC_MATCH_SHARPNESS_REFERENCE;
 
 static char *
 copy_string(const char *text)
@@ -327,6 +337,40 @@ copy_template(const eval_finger *finger, const eval_sample *exclude,
 	return count;
 }
 
+/*
+ * The driver's set scoring, but with the measure under test.  Keeping it
+ * here lets the evaluator compare the candidates on the very same data
+ * before one of them is wired into fpc_match_score_set().
+ */
+static double
+score_against_set(const uint8_t *probe, const uint8_t *frames, unsigned count,
+		  const fpc_match_params *params)
+{
+	double best = -1.0;
+
+	for (unsigned i = 0; i < count; i++) {
+		fpc_match_detail detail;
+		double score;
+
+		fpc_match_score_detail(probe, frames + (size_t)i * image_size,
+				       params, &detail);
+		switch (score_mode) {
+		case SCORE_SHARP:
+			score = detail.sharpness / sharp_reference;
+			break;
+		case SCORE_MIX:
+			score = detail.peak * (detail.sharpness / sharp_reference);
+			break;
+		default:
+			score = detail.peak;
+			break;
+		}
+		if (score > best)
+			best = score;
+	}
+	return best < 0.0 ? 0.0 : best;
+}
+
 static int
 evaluate(const eval_finger *fingers, size_t finger_count,
 	 const fpc_match_params *params, unsigned frame_limit,
@@ -346,8 +390,8 @@ evaluate(const eval_finger *fingers, size_t finger_count,
 
 			if (count == 0)
 				goto done;
-			score = fpc_match_score_set(probe->pixels, template_frames,
-						    count, params, NULL);
+			score = score_against_set(probe->pixels, template_frames,
+						  count, params);
 			if (push_score(genuine, score) != 0)
 				goto done;
 			for (size_t other = 0; other < finger_count; other++) {
@@ -357,8 +401,8 @@ evaluate(const eval_finger *fingers, size_t finger_count,
 						     template_frames);
 				if (count == 0)
 					goto done;
-				score = fpc_match_score_set(probe->pixels, template_frames,
-							    count, params, NULL);
+				score = score_against_set(probe->pixels, template_frames,
+							  count, params);
 				if (push_score(impostor, score) != 0)
 					goto done;
 			}
@@ -501,7 +545,11 @@ usage(FILE *stream, const char *program)
 		"the other captures. At least two labels and two images per label are\n"
 		"required. Quote glob patterns so the evaluator expands them.\n"
 		"--sweep tests shift fractions 1/8, 1/4, 1/3; rotation steps 0, 2, 4;\n"
-		"and template sizes 4, 8, 12, 16.\n",
+		"and template sizes 4, 8, 12, 16.\n"
+		"--score selects the measure: peak (plain correlation, what the\n"
+		"driver decides on), sharp (how far the peak rises above the rest\n"
+		"of the correlation plane) or mix (the product of the two);\n"
+		"--sharp-reference scales the sharpness into the [0,1] score range.\n",
 		program);
 }
 
@@ -525,6 +573,34 @@ main(int argc, char **argv)
 			goto done;
 		} else if (strcmp(argv[i], "--sweep") == 0) {
 			sweep = 1;
+		} else if (strcmp(argv[i], "--score") == 0) {
+			if (++i >= argc) {
+				fputs("--score expects peak, sharp or mix\n", stderr);
+				goto done;
+			}
+			if (strcmp(argv[i], "peak") == 0) {
+				score_mode = SCORE_PEAK;
+			} else if (strcmp(argv[i], "sharp") == 0) {
+				score_mode = SCORE_SHARP;
+			} else if (strcmp(argv[i], "mix") == 0) {
+				score_mode = SCORE_MIX;
+			} else {
+				fputs("--score expects peak, sharp or mix\n", stderr);
+				goto done;
+			}
+		} else if (strcmp(argv[i], "--sharp-reference") == 0) {
+			char *end;
+
+			if (++i >= argc)
+				goto done;
+			errno = 0;
+			sharp_reference = strtod(argv[i], &end);
+			if (errno || end == argv[i] || *end != '\0' ||
+			    !(sharp_reference > 0.0)) {
+				fputs("--sharp-reference expects a positive number\n",
+				      stderr);
+				goto done;
+			}
 		} else if (strcmp(argv[i], "--finger") == 0) {
 			if (++i >= argc || add_finger(&fingers, &finger_count,
 							       argv[i]) != 0)

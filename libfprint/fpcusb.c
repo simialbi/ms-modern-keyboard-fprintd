@@ -64,6 +64,7 @@ struct _FpiDeviceFpcUsb
   guint8       *enroll_frames;  /* FPC_TPL_MAX_FRAMES frames          */
   guint         enroll_count;
   guint         enroll_stage;
+  guint         match_attempt;
 
   guint            hello_tries;
   guint            dump_count;
@@ -101,6 +102,17 @@ struct _FpiDeviceFpcUsb
 #define FPCUSB_ENROLL_STAGES   16
 #define FPCUSB_MIN_COVERAGE    0.10
 #define FPCUSB_DUPLICATE_SCORE 0.95
+
+/*
+ * Presses one verification may consume.  libfprint allows exactly one
+ * result per verify operation (fpi_device_verify_report() insists on it),
+ * so a press that scores below the threshold cannot be reported as "try
+ * again" - the driver has to wait for the next press itself.  The sensor
+ * window is 5.6 x 4.4 mm: a genuine press that lands on skin the template
+ * has not seen scores as low as an impostor, and the honest answer to
+ * that is another press, not a lower threshold.
+ */
+#define FPCUSB_MATCH_ATTEMPTS  3
 
 /* Consecutive command failures that are treated as a wedged engine. */
 #define FPCUSB_WEDGE_FAILURES 8
@@ -1023,6 +1035,7 @@ fpcusb_operation_reset (FpiDeviceFpcUsb *self)
   self->recover_count = 0;
   self->enroll_count = 0;
   self->enroll_stage = 0;
+  self->match_attempt = 0;
   g_clear_pointer (&self->enroll_frames, g_free);
 }
 
@@ -1243,6 +1256,15 @@ fpcusb_verify_frame (FpDevice *dev, guint8 *frame)
            "coverage %.2f)", score, self->threshold, count, best_frame,
            coverage);
 
+  if (score < self->threshold &&
+      ++self->match_attempt < FPCUSB_MATCH_ATTEMPTS)
+    {
+      fp_warn ("below the threshold, waiting for another press (%u of %u)",
+               self->match_attempt + 1, FPCUSB_MATCH_ATTEMPTS);
+      fpcusb_capture_start (dev, TRUE);
+      return;
+    }
+
   fpcusb_operation_reset (self);
   fpi_device_verify_report (dev,
                             score >= self->threshold ? FPI_MATCH_SUCCESS
@@ -1299,6 +1321,15 @@ fpcusb_identify_frame (FpDevice *dev, guint8 *frame)
   fp_warn ("identify best score %.3f (threshold %.3f)", best_score,
            self->threshold);
 
+  if (best_score < self->threshold &&
+      ++self->match_attempt < FPCUSB_MATCH_ATTEMPTS)
+    {
+      fp_warn ("below the threshold, waiting for another press (%u of %u)",
+               self->match_attempt + 1, FPCUSB_MATCH_ATTEMPTS);
+      fpcusb_capture_start (dev, TRUE);
+      return;
+    }
+
   fpcusb_operation_reset (self);
   fpi_device_identify_report (dev,
                               best_score >= self->threshold ? best : NULL,
@@ -1336,13 +1367,16 @@ fpcusb_frame_captured (FpDevice *dev)
     }
 }
 
-/* The finger was lifted, the next enrolment stage can start. */
+/*
+ * The finger was lifted: the next enrolment stage, or the next
+ * verification attempt, can start.
+ */
 static void
 fpcusb_lift_detected (FpDevice *dev)
 {
   FpiDeviceFpcUsb *self = FPI_DEVICE_FPCUSB (dev);
 
-  if (self->action != FPCUSB_ACTION_ENROLL)
+  if (self->action == FPCUSB_ACTION_NONE)
     return;
 
   fpcusb_capture_start (dev, FALSE);

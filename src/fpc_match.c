@@ -17,6 +17,17 @@
 #define FPC_COARSE_STEP 4
 #define FPC_COARSE_SAMPLE_STEP 4u
 #define FPC_REFINE_CANDIDATES 2u
+/*
+ * Poses this close to the winning one are left out of the correlation
+ * plane statistics: they still overlap the same ridges and would hide
+ * how much the peak stands out.
+ */
+#define FPC_SHARP_EXCLUDE 8
+
+static double fpc_match_score_internal(const uint8_t *probe, const uint8_t *ref,
+				       const fpc_match_params *p, int *best_dx,
+				       int *best_dy, double *best_deg,
+				       double *sharpness);
 
 static int
 frame_size(unsigned width, unsigned height, size_t *size)
@@ -366,10 +377,110 @@ score_rotation(const uint8_t *rotated, const uint8_t *ref,
 	}
 }
 
+/*
+ * Spread of the correlation plane around the winning pose.  A genuine
+ * pair produces one sharp peak and poor scores everywhere else, two
+ * different fingers of generic ridge texture correlate mediocrely
+ * almost everywhere - so the peak alone cannot tell them apart, but how
+ * far it rises above its own plane can.
+ */
+static double
+plane_sharpness(const uint8_t *probe, const uint8_t *ref,
+		const fpc_match_params *p, uint8_t *rotated,
+		double *probe_integral, double *probe_sq_integral,
+		const double *ref_integral, const double *ref_sq_integral,
+		unsigned max_shift_x, unsigned max_shift_y,
+		int peak_x, int peak_y, double peak_deg, double peak)
+{
+	double radians = peak_deg * FPC_PI / 180.0;
+	unsigned margin_x, margin_y;
+	double sum = 0.0, sum_sq = 0.0;
+	size_t n = 0;
+	double mean, variance;
+
+	if (!safe_rotation_margin(p->width, p->height, radians,
+				  &margin_x, &margin_y))
+		return 0.0;
+	rotate_probe(probe, rotated, p->width, p->height, radians,
+		     margin_x, margin_y);
+	build_integrals(rotated, p->width, p->height,
+			probe_integral, probe_sq_integral);
+
+	for (int dy = -(int)max_shift_y; dy <= (int)max_shift_y;
+	     dy += FPC_COARSE_STEP) {
+		for (int dx = -(int)max_shift_x; dx <= (int)max_shift_x;
+		     dx += FPC_COARSE_STEP) {
+			double score;
+
+			if (abs(dx - peak_x) <= FPC_SHARP_EXCLUDE &&
+			    abs(dy - peak_y) <= FPC_SHARP_EXCLUDE)
+				continue;
+			score = score_rotation(rotated, ref, p, dx, dy,
+					       probe_integral, probe_sq_integral,
+					       ref_integral, ref_sq_integral,
+					       margin_x, margin_y,
+					       FPC_COARSE_SAMPLE_STEP);
+			if (score < -1.0)
+				continue;
+			sum += score;
+			sum_sq += score * score;
+			n++;
+		}
+	}
+
+	if (n < 8)
+		return 0.0;
+	mean = sum / n;
+	variance = sum_sq / n - mean * mean;
+	if (variance < 1e-9)
+		return 0.0;
+	return (peak - mean) / sqrt(variance);
+}
+
+double
+fpc_match_score_detail(const uint8_t *probe, const uint8_t *ref,
+		       const fpc_match_params *p, fpc_match_detail *detail)
+{
+	int best_dx_store = 0, best_dy_store = 0;
+	double best_deg_store = 0.0;
+	int *best_dx = &best_dx_store;
+	int *best_dy = &best_dy_store;
+	double *best_deg = &best_deg_store;
+	double sharpness = 0.0;
+	double score;
+
+	if (detail) {
+		detail->peak = 0.0;
+		detail->sharpness = 0.0;
+		detail->dx = 0;
+		detail->dy = 0;
+		detail->deg = 0.0;
+	}
+	score = fpc_match_score_internal(probe, ref, p, best_dx, best_dy,
+					 best_deg, detail ? &sharpness : NULL);
+	if (detail) {
+		detail->peak = score;
+		detail->sharpness = sharpness;
+		detail->dx = best_dx_store;
+		detail->dy = best_dy_store;
+		detail->deg = best_deg_store;
+	}
+	return score;
+}
+
 double
 fpc_match_score(const uint8_t *probe, const uint8_t *ref,
 		const fpc_match_params *p, int *best_dx, int *best_dy,
 		double *best_deg)
+{
+	return fpc_match_score_internal(probe, ref, p, best_dx, best_dy,
+					best_deg, NULL);
+}
+
+static double
+fpc_match_score_internal(const uint8_t *probe, const uint8_t *ref,
+			 const fpc_match_params *p, int *best_dx, int *best_dy,
+			 double *best_deg, double *sharpness)
 {
 	size_t len, integral_len;
 	size_t stride;
@@ -532,6 +643,15 @@ fpc_match_score(const uint8_t *probe, const uint8_t *ref,
 	}
 
 done:
+	if (sharpness) {
+		*sharpness = best > 0.0
+			? plane_sharpness(probe, ref, p, rotated,
+					  probe_integral, probe_sq_integral,
+					  ref_integral, ref_sq_integral,
+					  max_shift_x, max_shift_y,
+					  result_x, result_y, result_deg, best)
+			: 0.0;
+	}
 	free(integrals);
 	free(rotated);
 	if (best < 0.0)

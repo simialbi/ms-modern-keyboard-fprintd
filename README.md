@@ -40,7 +40,7 @@ driver for libfprint so that `fprintd`, GNOME/KDE settings, PAM login and
 | Sensor identification on hardware | **working** — FPC1022, hwid `0x0121`, 112 × 88 |
 | Live image capture on hardware | **working** — complete frame, CRC/id/sequence all valid, recognisable ridges |
 | libfprint driver | **working** — a plain `FpDevice` with its own enrol/verify/identify; `fprintd-enroll` completes all stages and `fprintd-verify` reports `verify-match` on hardware |
-| Matching quality | **works, thinly calibrated** — multi-frame correlation instead of NBIS; the genuine finger verifies on hardware, FAR/FRR measured on one person only, see [Matching quality](#matching-quality) |
+| Matching quality | **works, thinly calibrated** — multi-frame correlation instead of NBIS; the genuine finger verifies on hardware, but two fingers of one hand can reach 0.744, so the threshold is 0.78 and genuine presses may need a repeat, see [Matching quality](#matching-quality) |
 | Capture reliability | **much improved** — the per-attempt `ABORT` was the problem; without it the firmware answers every request (status `0x0003` = no finger) and 1841 consecutive polls ran without an error, see [`docs/PROTOCOL.md`](docs/PROTOCOL.md) §4.2 |
 
 Verified against a real keyboard (`045e:0815`, bcdDevice 1.13):
@@ -298,6 +298,11 @@ it compares the **images**.
   translation and a small rotation search; the best score decides.  A
   frame with too little contact is reported as `verify-retry-scan`, not
   as a no-match.
+* A press that stays below the threshold does **not** end the
+  verification: libfprint allows a driver exactly one result per verify,
+  so the driver itself waits for the next press and uses the best of up
+  to **three** presses (`FPCUSB_MATCH_ATTEMPTS`).  Just press again when
+  nothing seems to happen.
 * The very same file is compiled into the offline tools and the unit
   tests (`make test`, `make eval`), so what is measured is what ships.
 
@@ -323,9 +328,11 @@ reset the USB port: that made the kernel re-enumerate the keyboard and
 fprintd reported `enroll-disconnected` in the middle of a run.
 
 This is necessary because the window is so small: same finger/same spot
-scores ≈ 0.97, a different finger ≤ 0.33, but the same finger on a
-*different* spot only ≈ 0.17.  A single stored frame can therefore never
-be enough.
+scores ≈ 0.96, but the same finger on a *different* spot only ≈ 0.17 —
+and, measured later on two index fingers of the same hand, a **different
+finger still reaches 0.744**.  A single stored frame can therefore never
+be enough, and the threshold has to sit above what two different fingers
+of the same hand can reach.
 
 **The template is a set of fingerprint images.**  `fprintd` stores it
 under `/var/lib/fprint/<user>/fpcusb/` with mode 0600, owned by root —
@@ -334,44 +341,52 @@ just a feature vector.
 
 #### Measured calibration
 
-The evaluator uses held-out PGM presses from two different fingers: 15
-left-index captures and 11 right-index captures (26 genuine and 26
-impostor comparisons).  The measured configurations were:
+The calibration data are 26 real captures of **two index fingers of the
+same hand**: 15 left and 11 right presses, giving 160 same-finger and
+165 cross-finger comparisons.  Scored pairwise with the shipped matcher:
 
-| Search window | Rotation | Frames | EER (threshold) | FAR at 0.80 | FRR at 0.80 |
-| --- | ---: | ---: | ---: | ---: | ---: |
-| 37 × 29 px | ±4° (2 steps) | 12 | 0.1154 (0.648) | 0/26 | 4/26 |
-| 28 × 22 px | ±8° (4 steps) | 12 | 0.1538 (0.614) | 0/26 | 5/26 |
+| pair | median | maximum |
+| --- | ---: | ---: |
+| same finger | 0.618 | 0.960 |
+| different finger | 0.173 | **0.744** |
 
-That threshold of 0.80 turned out to be far too strict in practice: the
-evaluator builds its templates from frames of the same capture run,
-which makes genuine scores look better than they are.  What counts is the
-end-to-end measurement through `fprintd` on the keyboard (2025-11-26,
-scores taken from the journal):
+That maximum is the whole problem.  Against a 16-frame template the best
+score is 0.59 … 0.96 for the enrolled finger and up to 0.744 for the
+other one, so the FAR/FRR curve of the evaluator looks like this:
 
-| press | scores |
-| --- | --- |
-| enrolled finger, 12-frame template (5× + 1×) | 0.493, 0.506, 0.640, 0.723, 0.825, 0.854 |
-| enrolled finger, 16-frame template (5×) | 0.412, 0.474, 0.658, 0.671, 0.780 |
-| a finger never enrolled (6×) | 0.117, 0.312, 0.315, 0.365, 0.366, 0.389 |
-
-| threshold | genuine accepted | impostors accepted |
+| threshold | FAR | FRR |
 | ---: | ---: | ---: |
-| 0.80 | 2/11 | 0/6 |
-| 0.50 | 8/11 | 0/6 |
-| **0.45** | **9/11** | **0/6** |
-| 0.40 | 11/11 | 0/6 |
+| 0.45 | 18/26 | 1/26 |
+| 0.60 | 7/26 | 2/26 |
+| 0.65 | 3/26 | 3/26 (EER 0.115) |
+| **0.78** | **0/26** | **4/26** |
+| 0.85 | 0/26 | 6/26 |
 
-The two groups barely touch (0.389 against 0.412), so the shipped
-defaults are a **16-frame template** (one per enrolment stage), a
-37 × 29 pixel translation window, a ±4° rotation search and a threshold
-of **0.45** (`FPC_MATCH_THRESHOLD_DEFAULT` in `src/fpc_match.h`) - low
-enough to accept almost every genuine press, with a little margin left
-on the impostor side.
+The shipped defaults are therefore a **16-frame template** (one per
+enrolment stage), a 37 × 29 pixel translation window, a ±4° rotation
+search and a threshold of **0.78**
+(`FPC_MATCH_THRESHOLD_DEFAULT` in `src/fpc_match.h`).
 
-A rejected press is normal on a sensor this small: press again, slightly
-differently.  The score of the rejected press is in the journal, which
-makes it easy to see whether it was close or nowhere near.
+The earlier default of 0.45 came from an end-to-end round against a
+single, far less similar finger (impostor presses 0.117 … 0.389, genuine
+0.412 … 0.854) and was **wrong**: with it, the other index finger
+verified successfully on the hardware, and `fprintd` refused to enrol it
+at all with `enroll-duplicate`, because before every enrolment fprintd
+identifies the new press against all stored prints.  Both symptoms are
+the same false accept.
+
+A rejected press is normal on a sensor this small — the driver waits for
+up to three presses per verification before it answers.  The score of
+every press is in the journal, which makes it easy to see whether it was
+close or nowhere near.
+
+Narrowing the search window, changing the rotation range or the number
+of frames does not improve the separation (EER 0.115 … 0.27 across the
+whole sweep), and neither does judging the *sharpness* of the
+correlation peak instead of its height
+(`fpc-match-eval --score sharp|mix`, same EER).  What would help is more
+coverage of the fingertip — the genuine score only drops below 0.78 when
+the press lands on skin the template has never seen.
 
 If you want it stricter or more forgiving, pass the override to the
 installer - it ends up in fprintd's systemd drop-in:
@@ -381,10 +396,10 @@ sudo FPCUSB_THRESHOLD=0.60 ./libfprint/install.sh
 sudo systemctl restart fprintd
 ```
 
-These numbers come from **one person and 26 impostor comparisons**.
-Zero observed false accepts does *not* establish a production FAR, and
-both capture runs ended with a device reported error, so the sample is
-small.  Treat the sensor as a convenience factor, not as a security
+These numbers come from **one person and two fingers**.  Zero observed
+false accepts at 0.78 does *not* establish a production FAR — the
+measured 0.744 between two fingers of one hand shows how little room
+there is.  Treat the sensor as a convenience factor, not as a security
 grade one, until someone runs a broader study.
 
 You can repeat the measurement yourself, without root and without
@@ -416,7 +431,7 @@ for `fprintd-verify`:
 
 | variable | effect |
 | --- | --- |
-| `FPCUSB_THRESHOLD` | decision threshold, `(0, 1]`, default 0.45 |
+| `FPCUSB_THRESHOLD` | decision threshold, `(0, 1]`, default 0.78 |
 | `FPCUSB_MAX_SHIFT` | translation search radius in pixels, both axes |
 | `FPCUSB_ROT_STEPS` | rotation steps per side (0 disables the rotation search) |
 | `FPCUSB_DUMP_DIR` | write every captured frame there as PGM — **these are fingerprint images** |
@@ -426,7 +441,7 @@ so that it survives the default log level:
 
 ```sh
 journalctl -u fprintd -b --no-pager | grep "verify score"
-verify score 0.723 (threshold 0.500, best of 16 frames: #0, coverage 0.97)
+verify score 0.823 (threshold 0.780, best of 16 frames: #0, coverage 0.97)
 ```
 
 `fpc-bench` is kept as the documented counter example: it runs the NBIS
@@ -483,7 +498,9 @@ id table, the error handling — are in [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 | `hello: protocol error` | the firmware is out of sync; unplug/replug the keyboard |
 | capture never returns | it polls for a finger; press the fingerprint key and **hold it for ~1 s**, very brief taps can still fall between two requests |
 | no image at all any more, `info` still works | the imaging engine is wedged — un- and rebind the device (`/sys/bus/usb/drivers/usb/{unbind,bind}`, wait 5 s); a USB reset, a pipe reset, re-selecting the interface and even a replug have all been seen to fail (see [`docs/PROTOCOL.md`](docs/PROTOCOL.md) §4.2) |
-| `verify-no-match` for your own finger | the press hit an area the enrolment presses never covered — the score is in the journal (`journalctl -u fprintd \| grep "verify score"`); re-enrol covering more of the fingertip, or lower `FPCUSB_THRESHOLD` |
+| `verify-no-match` for your own finger | all three presses of this verification hit an area the enrolment never covered — the scores are in the journal (`journalctl -u fprintd \| grep "verify score"`); re-enrol covering more of the fingertip. Lowering `FPCUSB_THRESHOLD` below 0.75 lets *other* fingers in, see [Matching quality](#matching-quality) |
+| `verify-match` for a finger you did not enrol | the threshold is too low for this sensor; 0.78 is the measured minimum. Check `FPCUSB_THRESHOLD` in fprintd's drop-in and re-install |
+| `enroll-duplicate` for a second finger | fprintd compares every new finger against the already enrolled ones before enrolling, and a too low threshold makes a different finger look like a duplicate — same cause as a false `verify-match` |
 | `verify-retry-scan` | too little skin on the sensor, press flatter and hold ~2 s |
 | `enroll-retry-scan` | nothing arrived within 30 s — press the key and hold it for ~2 s; the stage is simply repeated |
 | `enroll-finger-not-centered` / `enroll-remove-and-retry` | the press was empty or identical to a previous one; lift the finger and place it slightly differently |

@@ -239,12 +239,50 @@ test_degenerate_inputs(void)
 	      "oversized translation search is clamped safely to the image");
 }
 
+/*
+ * fpc_match_score_detail() must agree with fpc_match_score() on the peak
+ * and report how far that peak rises above the rest of the correlation
+ * plane - the evaluator decides on these two numbers.
+ */
+static void
+test_score_detail(void)
+{
+	uint8_t a[PIXELS], b[PIXELS];
+	uint8_t flat[PIXELS];
+	fpc_match_params params;
+	fpc_match_detail detail;
+	double peak;
+
+	fpc_match_default_params(&params, WIDTH, HEIGHT);
+	for (unsigned y = 0; y < HEIGHT; y++) {
+		for (unsigned x = 0; x < WIDTH; x++) {
+			double value = 128.0 + 90.0 * sin((x + y * 0.4) * 0.7) *
+				cos(y * 0.3);
+
+			a[(size_t)y * WIDTH + x] = (uint8_t)value;
+			b[(size_t)y * WIDTH + x] = (uint8_t)value;
+		}
+	}
+	memset(flat, 128, sizeof flat);
+
+	peak = fpc_match_score(a, b, &params, NULL, NULL, NULL);
+	check(fpc_match_score_detail(a, b, &params, &detail) == peak &&
+	      detail.peak == peak,
+	      "score detail reports the same peak as the plain score");
+	check(detail.sharpness > 0.0 && isfinite(detail.sharpness),
+	      "an identical frame produces a peak above its own plane");
+	check(fpc_match_score_detail(flat, flat, &params, &detail) == 0.0 &&
+	      detail.sharpness == 0.0,
+	      "a constant frame has neither peak nor sharpness");
+}
+
 int
 main(void)
 {
 	test_matcher();
 	test_set_and_template();
 	test_degenerate_inputs();
+	test_score_detail();
 	printf(failures ? "\n%u matcher check(s) failed\n" :
 	       "\nall matcher checks passed\n", failures);
 	return failures ? 1 : 0;

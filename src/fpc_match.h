@@ -19,15 +19,29 @@ extern "C" {
 #define FPC_TPL_MAX_FRAMES 16
 #define FPC_TPL_HEADER_SIZE 14
 /*
- * Measured end to end through fprintd on the FPC1022 of the keyboard
- * (2025-11-26, 17 presses over a 12- and a 16-frame template): the
- * enrolled finger scores 0.412...0.854, a finger that was never enrolled
- * 0.117...0.389.  The two groups barely touch, so the threshold has to
- * sit between 0.39 and 0.41 to be perfect on this sample; 0.45 keeps a
- * margin on the impostor side and still accepts 9 of 11 genuine presses.
- * Overridable at run time with FPCUSB_THRESHOLD.
+ * Measured on 26 real captures of two index fingers of the same hand
+ * (15 + 11 presses, 165 cross-finger and 160 same-finger comparisons,
+ * 2025-11-26): two presses of the same finger that hit the same spot
+ * reach 0.96, but two *different* fingers still reach 0.744 - a 5.6 x
+ * 4.4 mm patch of plain ridge flow is simply not very individual.
+ * Against a 16-frame template the best score is 0.59...0.96 for the
+ * enrolled finger and at most 0.744 for the other one, so the decision
+ * boundary has to sit above 0.744: at 0.78 no impostor press of this
+ * set is accepted (FAR 0/26) at the cost of rejecting genuine presses
+ * that land on skin the template has not seen (FRR 4/26 here, more in
+ * practice - press again).  The earlier 0.45 was calibrated against a
+ * single, far less similar finger and let the other index finger verify
+ * successfully.  Overridable at run time with FPCUSB_THRESHOLD.
  */
-#define FPC_MATCH_THRESHOLD_DEFAULT 0.45
+#define FPC_MATCH_THRESHOLD_DEFAULT 0.78
+/*
+ * Reference for fpc_match_detail.sharpness, which the evaluator can use
+ * instead of the plain peak (--score sharp|mix).  On the set above it
+ * did not separate the two fingers any better than the peak, so the
+ * driver decides on the peak alone; the measure is kept because it is
+ * what showed that.
+ */
+#define FPC_MATCH_SHARPNESS_REFERENCE 6.0
 
 /*
  * Logical template header. The serialized representation is a 14-byte,
@@ -55,6 +69,21 @@ typedef struct {
 	unsigned min_overlap_px;
 } fpc_match_params;
 
+/*
+ * Result of one comparison: the height of the correlation peak and how
+ * far it rises above the rest of the correlation plane, in standard
+ * deviations.  Two different fingers correlate mediocrely at almost
+ * every pose, so the peak alone separates them badly while the
+ * sharpness does it well - see the table in README.md.
+ */
+typedef struct {
+	double peak;
+	double sharpness;
+	int    dx;
+	int    dy;
+	double deg;
+} fpc_match_detail;
+
 void fpc_match_default_params(fpc_match_params *p, unsigned width,
 			      unsigned height);
 void fpc_match_preprocess(uint8_t *frame, unsigned width, unsigned height);
@@ -63,6 +92,10 @@ double fpc_match_coverage(const uint8_t *frame, unsigned width,
 /* dx/dy are the probe-coordinate offsets into ref at the best pose. */
 double fpc_match_score(const uint8_t *probe, const uint8_t *ref,
 		       const fpc_match_params *p, int *dx, int *dy, double *deg);
+/* Same comparison, but also reports the correlation-plane sharpness. */
+double fpc_match_score_detail(const uint8_t *probe, const uint8_t *ref,
+			      const fpc_match_params *p,
+			      fpc_match_detail *detail);
 double fpc_match_score_set(const uint8_t *probe, const uint8_t *frames,
 			   unsigned count, const fpc_match_params *p,
 			   unsigned *best_index);
