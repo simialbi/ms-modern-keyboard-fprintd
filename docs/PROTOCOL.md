@@ -185,6 +185,14 @@ The Windows stack also contains:
 * `KeyboardFingerprintEngine.dll` — the FPC matching algorithm, template
   creation, and enrolment quality feedback.  On Linux this job is done by
   libfprint's own NBIS/bozorth3 pipeline, so it is not needed.
+
+  NBIS is not a free replacement though: it was designed for full sized
+  500 dpi prints, and bozorth3 scores a comparison with **0** as soon as
+  one of the two prints carries fewer than ten minutiae — which a
+  5.6 × 4.4 mm image easily undercuts.  The libfprint driver therefore
+  normalises the contrast and enlarges every frame before it hands it
+  over; `tools/fpc_bench.c` measures how many minutiae a given
+  preprocessing actually yields.
 * A "secure"/match-on-chip path and firmware update commands.  Neither is
   used by the normal enrol/verify flow of this sensor: the firmware only
   streams raw images, the matching happens on the host in both worlds.

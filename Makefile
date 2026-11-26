@@ -22,8 +22,14 @@ BUILD   := build
 OBJS    := $(BUILD)/fpc_usb.o $(BUILD)/fpc_capture.o
 TARGET  := $(BUILD)/fpc-capture
 TESTBIN := $(BUILD)/test-frames
+BENCH   := $(BUILD)/fpc-bench
 
-.PHONY: all clean install uninstall test
+# fpc-bench reuses the NBIS matcher of libfprint, so it needs a checkout
+# that libfprint/install.sh has already built (build/libfprint by default).
+LIBFPRINT ?= $(BUILD)/libfprint
+NBIS      := $(LIBFPRINT)/_build/libfprint/libnbis.a
+
+.PHONY: all clean install uninstall test bench
 
 all: $(TARGET)
 
@@ -42,6 +48,22 @@ $(TESTBIN): tests/test_frames.c $(BUILD)/fpc_usb.o
 
 test: $(TESTBIN)
 	./$(TESTBIN)
+
+# Offline matcher: scores PGM files captured with fpc-capture exactly the
+# way libfprint scores them during a verification.
+bench: $(BENCH)
+
+$(BENCH): tools/fpc_bench.c $(NBIS) | $(BUILD)
+	@test -r "$(NBIS)" || { \
+		echo "$(NBIS) is missing - run libfprint/install.sh first"; \
+		exit 1; }
+	$(CC) $(CFLAGS) \
+		-I$(LIBFPRINT)/libfprint \
+		-I$(LIBFPRINT)/libfprint/nbis/include \
+		-I$(LIBFPRINT)/libfprint/nbis/libfprint-include \
+		$(shell $(PKG_CONFIG) --cflags glib-2.0) \
+		$< $(NBIS) -o $@ \
+		$(shell $(PKG_CONFIG) --libs glib-2.0) -lm
 
 install: $(TARGET)
 	install -Dm755 $(TARGET) $(DESTDIR)$(PREFIX)/bin/fpc-capture

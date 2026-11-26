@@ -39,6 +39,23 @@ struct _FpiDeviceFpcUsb
 /* The sensor ignores the first commands after it has been powered on. */
 #define FPCUSB_HELLO_TRIES 20
 
+/*
+ * The FPC1022 in this keyboard images 5.6 x 4.4 mm (112 x 88 pixels at
+ * 508 dpi).  That is very little for the NBIS pipeline of libfprint:
+ * bozorth3 refuses to compute a score at all when one of the two prints
+ * has fewer than MIN_COMPUTABLE_BOZORTH_MINUTIAE (10) minutiae and
+ * returns 0, which looks exactly like "verify-no-match" - no matter how
+ * low the threshold is.  Enrolment on the other hand never compares
+ * anything, so it happily succeeds with the very same images.
+ *
+ * The frame is therefore stretched over the full grey range and enlarged
+ * before it is handed over, the same trick the aes3k and elanspi drivers
+ * use for their small sensors.  tools/fpc_bench.c measures the effect of
+ * both knobs on real captures.
+ */
+#define FPCUSB_ENLARGE 2
+#define FPCUSB_CLIP    50       /* ignore 1/50 of the pixels per end */
+
 G_DEFINE_TYPE (FpiDeviceFpcUsb, fpi_device_fpcusb, FP_TYPE_IMAGE_DEVICE)
 
 /* ------------------------------------------------------------------ */
@@ -91,6 +108,57 @@ fpcusb_geometry (FpiDeviceFpcUsb *self)
     self->width = 192, self->height = 192;
 
   fp_dbg ("sensor hwid 0x%04x -> %ux%u", hw, self->width, self->height);
+}
+
+/*
+ * Spread the used part of the histogram over the full range.  The sensor
+ * only ever uses a fraction of it and NBIS drops every block whose
+ * contrast stays below a fixed delta, so without this most of the image
+ * never contributes a single minutia.
+ */
+static void
+fpcusb_normalize (guint8 *data, gsize len)
+{
+  guint hist[256] = { 0 };
+  gsize cut = len / FPCUSB_CLIP;
+  gsize acc = 0;
+  gint lo = 0, hi = 255;
+  gdouble scale;
+
+  for (gsize i = 0; i < len; i++)
+    hist[data[i]]++;
+
+  for (gint i = 0; i < 256; i++)
+    {
+      acc += hist[i];
+      if (acc > cut)
+        {
+          lo = i;
+          break;
+        }
+    }
+
+  acc = 0;
+  for (gint i = 255; i >= 0; i--)
+    {
+      acc += hist[i];
+      if (acc > cut)
+        {
+          hi = i;
+          break;
+        }
+    }
+
+  if (hi <= lo)
+    return;
+
+  scale = 255.0 / (hi - lo);
+  for (gsize i = 0; i < len; i++)
+    {
+      gdouble v = (data[i] - lo) * scale;
+
+      data[i] = (guint8) CLAMP (v, 0.0, 255.0);
+    }
 }
 
 /* Build an 8 byte command frame. */
@@ -420,7 +488,8 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
   FpiDeviceFpcUsb *self = FPI_DEVICE_FPCUSB (dev);
   FpiUsbTransfer *t;
   GError *error = NULL;
-  FpImage *img;
+  FpImage *img, *raw;
+  gsize pixels;
   gsize want;
 
   if (self->deactivating)
@@ -485,10 +554,23 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
           return;
         }
 
-      img = fp_image_new (self->width, self->height);
-      img->flags |= FPI_IMAGE_COLORS_INVERTED;
-      memcpy (img->data, self->frame + 6,
-              (gsize) self->width * self->height);
+      pixels = (gsize) self->width * self->height;
+      raw = fp_image_new (self->width, self->height);
+      raw->flags |= FPI_IMAGE_COLORS_INVERTED;
+      memcpy (raw->data, self->frame + 6, pixels);
+      fpcusb_normalize (raw->data, pixels);
+
+      if (FPCUSB_ENLARGE > 1)
+        {
+          img = fpi_image_resize (raw, FPCUSB_ENLARGE, FPCUSB_ENLARGE);
+          img->ppmm = raw->ppmm * FPCUSB_ENLARGE;
+          g_object_unref (raw);
+        }
+      else
+        {
+          img = raw;
+        }
+
       fpi_image_device_image_captured (FP_IMAGE_DEVICE (dev), img);
       fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), FALSE);
       fpi_ssm_mark_completed (ssm);
@@ -611,14 +693,22 @@ fpi_device_fpcusb_class_init (FpiDeviceFpcUsbClass *klass)
   dev_class->id_table = id_table;
   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
 
+  /* One press covers so little of the finger that the five samples of
+   * the default enrolment hardly ever overlap with the finger position
+   * of a later verification. */
+  dev_class->nr_enroll_stages = 10;
+
   img_class->img_open = fpcusb_open;
   img_class->img_close = fpcusb_close;
   img_class->activate = fpcusb_activate;
   img_class->deactivate = fpcusb_deactivate;
   img_class->change_state = fpcusb_change_state;
 
-  /* Geometry is learned at open time; these are the FPC1020 defaults. */
-  img_class->img_width = 192;
-  img_class->img_height = 192;
-  img_class->bz3_threshold = 25;
+  /* The geometry depends on the sensor and is learned at open time. */
+  img_class->img_width = -1;
+  img_class->img_height = -1;
+
+  /* A press of this sensor yields a handful of minutiae, which scores
+   * far below what a full sized sensor reaches; 25 is never met. */
+  img_class->bz3_threshold = 20;
 }

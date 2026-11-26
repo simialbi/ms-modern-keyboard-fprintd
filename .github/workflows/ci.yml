@@ -169,3 +169,12 @@ jobs:
           test -f build/libfprint/_build/libfprint/libfprint-2.so.2
           grep -q "fpi_device_fpcusb_get_type" \
             build/libfprint/_build/libfprint/fpi-drivers.c
+
+      # fpc-bench links the NBIS matcher of that very checkout.
+      - name: Build and smoke test fpc-bench
+        run: |
+          make bench
+          if ./build/fpc-bench; then
+            echo "fpc-bench should have printed its usage"
+            exit 1
+          fi
