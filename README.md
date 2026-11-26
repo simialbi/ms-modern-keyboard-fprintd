@@ -62,7 +62,7 @@ libfprint 1.94.100 and fprintd 1.94.5:
 
 ```
 $ fprintd-list $USER
-User <username> has no fingers enrolled for Microsoft Modern Keyboard with Fingerprint ID (FPC).
+User simialbi has no fingers enrolled for Microsoft Modern Keyboard with Fingerprint ID (FPC).
 $ fprintd-enroll
 Enrolling right-index-finger finger.
 Enroll result: enroll-stage-passed
@@ -177,10 +177,13 @@ drivers statically, the library has to be rebuilt with the driver in it.
 It
 
 1. clones libfprint and checks out the version that is installed on the
-   system (falling back to the default branch if that tag cannot be
-   configured with the local meson),
+   system — or the newest release if libfprint is not installed, as on a
+   CI runner — falling back to the default branch when that ref cannot
+   be configured or built with the local meson,
 2. copies `fpcusb.c`/`fpcusb.h` into `libfprint/drivers/` and registers
-   the driver in `meson.build` and `libfprint/meson.build`,
+   the driver in the `drivers_info` dictionary of `meson.build` and in
+   `driver_sources` of `libfprint/meson.build`, aborting if upstream
+   renamed them instead of producing a library without the driver,
 3. builds and installs into `/usr/local` — the distribution package is
    left untouched,
 4. installs `udev/60-fpc-keyboard.rules`,

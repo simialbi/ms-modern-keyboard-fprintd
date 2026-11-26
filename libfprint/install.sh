@@ -148,14 +148,20 @@ fi
 DEFAULT_BRANCH=$(git -C "$SRCDIR" symbolic-ref --short refs/remotes/origin/HEAD 2>/dev/null | cut -d/ -f2-)
 : "${DEFAULT_BRANCH:=master}"
 
-# The release tag is preferred because it matches the installed library
-# exactly; if it cannot be configured (old tags break with new meson
-# releases) the same version from the default branch is used instead.
+# v[0-9]*: the pre-1.0 tags are named v_0_5_1 and would sort to the top.
+LATEST_TAG=$(git -C "$SRCDIR" tag --list 'v[0-9]*' --sort=-v:refname | head -n 1)
+
+# The release tag matching the installed library is preferred, because the
+# patched build has to stay ABI compatible with the fprintd on this system.
+# When it cannot be built (old tags break with new meson releases, new tags
+# need a newer meson than the distribution ships) the next candidate is
+# tried.  Without an installed libfprint - typically on a CI runner - the
+# newest release is built, with the default branch as the fallback.
 if [ -n "$REF" ] && git -C "$SRCDIR" rev-parse --verify --quiet "$REF" >/dev/null; then
 	CANDIDATES="$REF $DEFAULT_BRANCH"
 else
-	[ -n "$REF" ] && say "no ref $REF upstream, using $DEFAULT_BRANCH"
-	CANDIDATES=$DEFAULT_BRANCH
+	[ -n "$REF" ] && say "no ref $REF upstream, using the newest release"
+	CANDIDATES="${LATEST_TAG:+$LATEST_TAG }$DEFAULT_BRANCH"
 fi
 
 # ------------------------------------------------------------------ #
@@ -171,32 +177,50 @@ import pathlib, sys
 
 src = pathlib.Path(sys.argv[1])
 
+
+def dict_span(text, name, path):
+    """Return (start, end) of the body of a top level `name = { ... }`."""
+    start = text.find(name + ' = {')
+    if start < 0:
+        sys.exit('%s: dictionary %s not found - the upstream build files '
+                 'changed, the driver registration needs an update' %
+                 (path, name))
+    end = text.find('\n}\n', start)
+    if end < 0:
+        sys.exit('%s: end of dictionary %s not found' % (path, name))
+    return start, end
+
+
+def register(path, name, entry):
+    """Add `entry` as the last element of the dictionary `name`."""
+    text = path.read_text()
+    start, end = dict_span(text, name, path)
+    if "'fpcusb'" in text[start:end]:
+        return False
+
+    path.write_text(text[:end] + '\n' + entry + text[end:])
+
+    # Never trust the edit: a silently skipped replacement is exactly what
+    # made meson fail later with "Key fpcusb is not in the dictionary".
+    text = path.read_text()
+    start, end = dict_span(text, name, path)
+    if "'fpcusb'" not in text[start:end]:
+        sys.exit('%s: could not register fpcusb in %s' % (path, name))
+    return True
+
+
 # 1. top level meson.build: driver metadata (no 'optional' -> default set)
-p = src / 'meson.build'
-s = p.read_text()
-if "'fpcusb'" not in s:
-    anchor = "    # SPI driver"
-    if anchor not in s:
-        sys.exit("meson.build: cannot find the drivers_info anchor")
-    s = s.replace(anchor, "    'fpcusb': {},\n\n" + anchor, 1)
-    p.write_text(s)
-    print("  registered in meson.build")
+if register(src / 'meson.build', 'drivers_info', "    'fpcusb': {},"):
+    print('  registered in meson.build')
 
 # 2. libfprint/meson.build: source file of the driver
-q = src / 'libfprint' / 'meson.build'
-t = q.read_text()
-if "'fpcusb'" not in t:
-    anchor = "helper_sources = {"
-    if anchor not in t:
-        sys.exit("libfprint/meson.build: cannot find the driver_sources anchor")
-    t = t.replace("}\n\n" + anchor,
-                  "    'fpcusb' : files('drivers/fpcusb.c'),\n}\n\n" + anchor, 1)
-    q.write_text(t)
-    print("  registered in libfprint/meson.build")
+if register(src / 'libfprint' / 'meson.build', 'driver_sources',
+            "    'fpcusb': files('drivers/fpcusb.c'),"):
+    print('  registered in libfprint/meson.build')
 PY
 }
 
-configured=
+built=
 for ref in $CANDIDATES; do
 	say "preparing libfprint $ref"
 	git -C "$SRCDIR" -c advice.detachedHead=false \
@@ -208,23 +232,32 @@ for ref in $CANDIDATES; do
 	add_driver
 
 	rm -rf "$BUILDDIR"
-	if meson setup "$BUILDDIR" "$SRCDIR" --prefix="$PREFIX" \
+	if ! meson setup "$BUILDDIR" "$SRCDIR" --prefix="$PREFIX" \
 		-Dintrospection=false -Ddoc=false -Dgtk-examples=false \
 		-Dinstalled-tests=false -Dudev_hwdb=disabled \
 		>"$SRCDIR/meson-setup.log" 2>&1; then
-		configured=$ref
+		say "$ref cannot be configured with this meson, trying the next ref"
+		tail -5 "$SRCDIR/meson-setup.log"
+		continue
+	fi
+	say "configured libfprint $ref in $BUILDDIR"
+
+	say "building"
+	if ninja -C "$BUILDDIR"; then
+		built=$ref
 		break
 	fi
-	say "$ref cannot be configured with this meson, trying the next ref"
-	tail -5 "$SRCDIR/meson-setup.log"
+	say "$ref does not build here, trying the next ref"
 done
 
-[ -n "$configured" ] ||
-	die "meson setup failed, see $SRCDIR/meson-setup.log"
-say "configured libfprint $configured in $BUILDDIR"
+[ -n "$built" ] ||
+	die "no libfprint revision could be built, see $SRCDIR/meson-setup.log"
 
-say "building"
-ninja -C "$BUILDDIR"
+# Paranoia: the library is useless to us without the driver in it.
+if ! grep -q fpi_device_fpcusb_get_type "$BUILDDIR/libfprint/fpi-drivers.c"; then
+	die "the fpcusb driver did not end up in the generated driver list"
+fi
+say "built libfprint $built with the fpcusb driver"
 
 if [ "$BUILD_ONLY" = 1 ]; then
 	say "built $BUILDDIR/libfprint/libfprint-2.so.2 (not installed)"
