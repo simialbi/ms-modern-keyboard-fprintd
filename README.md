@@ -39,8 +39,8 @@ driver for libfprint so that `fprintd`, GNOME/KDE settings, PAM login and
 | CRC implementation | verified against the CRC-16/CCITT-FALSE reference vector |
 | Sensor identification on hardware | **working** — FPC1022, hwid `0x0121`, 112 × 88 |
 | Live image capture on hardware | **working** — complete frame, CRC/id/sequence all valid, recognisable ridges |
-| libfprint driver | **working** — built into libfprint 1.94.100, `fprintd-enroll` completes on real hardware |
-| Matching quality | **unsolved** — libfprint's NBIS matcher cannot work on 112 × 88 frames, see [Matching quality](#matching-quality-verify-no-match) |
+| libfprint driver | **working** — a plain `FpDevice` with its own enrol/verify/identify, builds into libfprint |
+| Matching quality | **implemented, thinly calibrated** — multi-frame correlation instead of NBIS; FAR/FRR measured on one person only, see [Matching quality](#matching-quality) |
 | Capture reliability | **partly solved** — the sensor has to be polled; it still wedges after a few hundred cycles, see [`docs/PROTOCOL.md`](docs/PROTOCOL.md) §4.2 |
 
 Verified against a real keyboard (`045e:0815`, bcdDevice 1.13):
@@ -106,11 +106,11 @@ covers everything that works offline:
 
 | job | what it does |
 | --- | --- |
-| `build` | builds with **gcc and clang** on Ubuntu 24.04 and 22.04, runs `make test`, checks that the CLI exits cleanly without hardware, and verifies `make install` / `make uninstall` into a staging dir |
+| `build` | builds with **gcc and clang** on Ubuntu 24.04 and 22.04, runs `make test` (protocol + matcher) and the `fpc-match-eval` smoke test, checks that the CLI exits cleanly without hardware, and verifies `make install` / `make uninstall` into a staging dir |
 | `sanitizers` | rebuilds the tests with AddressSanitizer + UndefinedBehaviorSanitizer |
 | `static-analysis` | `cppcheck` (informational) and the clang static analyzer via `scan-build --status-bugs` (blocking) |
 | `udev-rule` | `udevadm verify` on `udev/60-fpc-keyboard.rules` |
-| `libfprint-driver` | clones upstream libfprint, drops `libfprint/fpcusb.c` in and builds it — non-blocking, because upstream changes frequently |
+| `libfprint-driver` | clones upstream libfprint, drops `libfprint/fpcusb.c` plus the shared matcher in, builds it and re-checks that both sources compile warning-free — non-blocking, because upstream changes frequently |
 
 The binary built on Ubuntu 24.04 is uploaded as a workflow artifact.
 
@@ -184,10 +184,12 @@ It
    system — or the newest release if libfprint is not installed, as on a
    CI runner — falling back to the default branch when that ref cannot
    be configured or built with the local meson,
-2. copies `fpcusb.c`/`fpcusb.h` into `libfprint/drivers/` and registers
-   the driver in the `drivers_info` dictionary of `meson.build` and in
-   `driver_sources` of `libfprint/meson.build`, aborting if upstream
-   renamed them instead of producing a library without the driver,
+2. copies `fpcusb.c`/`fpcusb.h` **and** the shared matcher
+   `src/fpc_match.c|h` (as `fpcusb_match.c|h`) into `libfprint/drivers/`
+   and registers both sources in the `drivers_info` dictionary of
+   `meson.build` and in `driver_sources` of `libfprint/meson.build`,
+   aborting if upstream renamed them instead of producing a library
+   without the driver,
 3. builds and installs into `/usr/local` — the distribution package is
    left untouched,
 4. installs `udev/60-fpc-keyboard.rules`,
@@ -207,10 +209,16 @@ sudo apt install git meson ninja-build libglib2.0-dev libgusb-dev \
 Afterwards:
 
 ```sh
-fprintd-list "$USER"   # should report the device ("no prints" is fine)
-fprintd-enroll         # touch the fingerprint key when asked
+fprintd-delete "$USER"   # mandatory after a driver update, see below
+fprintd-list "$USER"     # should report the device ("no prints" is fine)
+fprintd-enroll           # twelve presses, see the enrolment advice below
 fprintd-verify
 ```
+
+**Always delete the old prints after installing or updating this
+driver.**  The driver stores its own template format; prints enrolled
+with an earlier version (or with the built-in sensor) are rejected with
+"please delete it and enrol again".
 
 Enable it for login with `pam-auth-update` (Debian/Ubuntu) or by adding
 `auth sufficient pam_fprintd.so` to the relevant PAM stack (Arch:
@@ -230,13 +238,15 @@ The driver reports:
 
 * scan type **press** (touch sensor, not a swipe sensor),
 * geometry taken from the sensor at open time,
-* `FPI_IMAGE_COLORS_INVERTED`, because the raw image has dark ridges,
-* ten enrolment stages, see below.
+* twelve enrolment stages, see below,
+* its **own** matching: the driver is a plain `FpDevice`, not an
+  `FpImageDevice`, because libfprint's minutiae matcher cannot work on a
+  sensor this small (see below).
 
-### Matching quality (`verify-no-match`)
+### Matching quality
 
 The sensor only images **5.6 × 4.4 mm** (112 × 88 pixels at 508 dpi),
-which is tiny for libfprint's NBIS pipeline, and that has a consequence
+which is tiny for libfprint's NBIS pipeline, and that had a consequence
 that is easy to misread:
 
 * enrolment never compares anything — every scan is turned into a set of
@@ -250,25 +260,10 @@ reports `verify-no-match` forever, no matter how low the threshold is
 set.  **That is exactly what this sensor does**, and the measurement
 below says it cannot be fixed by preprocessing: ten real presses of one
 finger yield 0 to 2 minutiae each and every bozorth3 score is 0, at 1×,
-2× and 3× enlargement, with and without normalisation.
+2× and 3× enlargement, with and without normalisation.  That is why the
+driver no longer uses that pipeline at all.
 
-The driver still does what can be done on the NBIS side:
-
-* stretches the histogram of every frame over the full grey range
-  (`FPCUSB_CLIP`) — NBIS discards low contrast blocks, and the sensor
-  uses only a part of the range,
-* enlarges the image (`FPCUSB_ENLARGE`, 2× by default), the same trick
-  the `aes3k` and `elanspi` drivers use for their small sensors,
-* uses `bz3_threshold = 20` instead of the default 40,
-* asks for ten enrolment samples instead of five, because one press
-  covers so little of the finger that a later verification easily
-  touches an area that was never enrolled.
-
-**After changing any of this, delete and redo the enrolment**
-(`fprintd-delete "$USER"`), because the stored templates were extracted
-with the old preprocessing.
-
-#### Why that is not enough (measured on real presses)
+#### Why NBIS cannot be tuned into working here (measured on real presses)
 
 The numbers further down were obtained from crops of libfprint's own
 reference print, which is a *full sized* scan reduced to this geometry —
@@ -287,39 +282,111 @@ score is 0 — including the comparison of a frame with itself.  No
 threshold, no enlargement and no contrast trick changes that: a
 5.6 × 4.4 mm window does not contain ten ridge endings.
 
-Matching this sensor therefore requires what the vendor algorithm does:
-compare the **images** (normalised cross correlation over shifts and
-small rotations) against *several* stored frames per finger.  Measured
-here: same finger, same spot → 0.97; different finger → ≤ 0.33; same
-finger but a different spot → 0.17, which is why a single template per
-finger cannot work.  That matcher is **not implemented yet**; until it
-is, `fprintd-verify` will keep reporting `verify-no-match`.
+#### What the driver does instead
 
-The two knobs can be measured instead of guessed — `tools/fpc_bench.c`
-runs the very same NBIS extraction and bozorth3 matching over PGM files,
-without fprintd and without root:
+The driver matches this sensor the way the vendor algorithm does:
+it compares the **images**.
+
+* Every frame is preprocessed by `src/fpc_match.c`: the histogram is
+  stretched over the full grey range and a local mean is subtracted, so
+  that pressure and dry skin do not dominate the comparison.
+* A finger's template is a **set of up to 16 frames**, stored in a
+  versioned blob (`"FPCT"`) inside the print; enrolment collects twelve
+  presses and rejects a press that covers too little of the sensor or
+  that is a near duplicate (score ≥ 0.95) of an already stored one,
+  which is why it asks you to move the finger around.
+* A verification captures one frame and scores it against **every** frame
+  of the template by zero mean normalised cross correlation over a
+  translation and a small rotation search; the best score decides.  A
+  frame with too little contact is reported as `verify-retry-scan`, not
+  as a no-match.
+* The very same file is compiled into the offline tools and the unit
+  tests (`make test`, `make eval`), so what is measured is what ships.
+
+How to enrol so that verification actually works:
+
+* give each press a clear lift and hold it for about a second — brief
+  taps are not answered by the firmware at all,
+* **move the finger between presses**: roll it slightly left/right, up
+  and down, and vary the angle.  Twelve presses of exactly the same spot
+  produce a template that only recognises that spot, and the driver will
+  ask you to lift and retry when it sees the same image twice,
+* use the part of the fingertip you actually put on the key when logging
+  in.
+
+This is necessary because the window is so small: same finger/same spot
+scores ≈ 0.97, a different finger ≤ 0.33, but the same finger on a
+*different* spot only ≈ 0.17.  A single stored frame can therefore never
+be enough.
+
+**The template is a set of fingerprint images.**  `fprintd` stores it
+under `/var/lib/fprint/<user>/fpcusb/` with mode 0600, owned by root —
+but anyone who can read those files has pictures of your fingertip, not
+just a feature vector.
+
+#### Measured calibration
+
+The evaluator uses held-out PGM presses from two different fingers: 15
+left-index captures and 11 right-index captures (26 genuine and 26
+impostor comparisons).  The measured configurations were:
+
+| Search window | Rotation | Frames | EER (threshold) | FAR at 0.80 | FRR at 0.80 |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| 37 × 29 px | ±4° (2 steps) | 12 | 0.1154 (0.648) | 0/26 | 4/26 |
+| 28 × 22 px | ±8° (4 steps) | 12 | 0.1538 (0.614) | 0/26 | 5/26 |
+
+The shipped defaults are therefore a 12-frame template, a 37 × 29 pixel
+translation window, a ±4° rotation search and a threshold of 0.80
+(`FPC_MATCH_THRESHOLD_DEFAULT` in `src/fpc_match.h`).
+
+These numbers come from **one person and 26 impostor comparisons**.
+Zero observed false accepts does *not* establish a production FAR, and
+both capture runs ended with a device reported error, so the sample is
+small.  Treat the sensor as a convenience factor, not as a security
+grade one, until someone runs a broader study.
+
+You can repeat the measurement yourself, without root and without
+fprintd — the evaluator uses the very same matcher as the driver:
 
 ```sh
-./libfprint/install.sh --build-only    # provides build/libfprint/_build
-make bench
+make eval
 
-./build/fpc-capture loop /tmp/right-   # 5-6 presses of ONE finger
-./build/fpc-bench --sweep /tmp/right-*.pgm
+./build/fpc-capture loop /tmp/left-    # ~15 presses of ONE finger
+./build/fpc-capture loop /tmp/right-   # ~12 presses of ANOTHER finger
+
+./build/fpc-match-eval \
+    --finger 'left:/tmp/left-*.pgm' --finger 'right:/tmp/right-*.pgm'
+./build/fpc-match-eval --sweep \
+    --finger 'left:/tmp/left-*.pgm' --finger 'right:/tmp/right-*.pgm'
 ```
 
-The `>=10 min.` column is the one that decides whether matching is
-possible at all; `score.med` then shows what threshold is realistic.
-Pick the winning variant and set `FPCUSB_ENLARGE` / `bz3_threshold` in
-`libfprint/fpcusb.c` accordingly.  Running a *different* finger through
-`./build/fpc-bench --scale 2 --normalize` prints the full score matrix
-and shows the impostor scores the threshold has to stay above.
+The first invocation prints the FAR/FRR curve, the EER and both score
+histograms for the shipped configuration; `--sweep` compares search
+windows, rotation ranges and template sizes.  Every print is scored
+against a template built from the *other* presses of the same finger, so
+no frame ever matches itself.
 
-The NBIS defaults above come from such a measurement — on *synthetic*
-input, which is why they looked far better than the hardware turned out
-to be.  Four overlapping 112 × 88 crops — the exact geometry of this
-sensor — of libfprint's own reference print
-(`examples/prints/loop-right.png`), plus one crop of a different area as
-an impostor:
+#### Debugging the matcher at runtime
+
+These environment variables are read once when the device is opened, so
+set them for the whole `fprintd` service (`systemctl edit fprintd`), not
+for `fprintd-verify`:
+
+| variable | effect |
+| --- | --- |
+| `FPCUSB_THRESHOLD` | decision threshold, `(0, 1]`, default 0.80 |
+| `FPCUSB_MAX_SHIFT` | translation search radius in pixels, both axes |
+| `FPCUSB_ROT_STEPS` | rotation steps per side (0 disables the rotation search) |
+| `FPCUSB_DUMP_DIR` | write every captured frame there as PGM — **these are fingerprint images** |
+
+`fpc-bench` is kept as the documented counter example: it runs the NBIS
+extraction and bozorth3 matching that *cannot* work here
+(`make bench`, needs `./libfprint/install.sh --build-only` first).  Its
+numbers below were taken on *synthetic* input, which is why they looked
+far better than the hardware turned out to be.  Four overlapping
+112 × 88 crops — the exact geometry of this sensor — of libfprint's own
+reference print (`examples/prints/loop-right.png`), plus one crop of a
+different area as an impostor:
 
 ```
 variant                             min.med >=10 min. score.med     >=thr(20)
@@ -335,9 +402,10 @@ genuine pairs 23 … 38      impostor 3
 
 At 1× not a single image reaches ten minutiae, so every comparison
 scores 0 — that is the `verify-no-match` that cannot be fixed with a
-threshold.  2× clears the hurdle with a wide margin between genuine and
-impostor scores, 3× blurs the ridges again, and removing the perimeter
-points costs more than it gains on an image this small.
+threshold.  2× clears the hurdle here only because this is a crop of a
+full sized scan; on real presses from the keyboard even 2× and 3× stay
+at 0 to 2 minutiae (table above), which is what made the correlation
+matcher necessary.
 
 ## How it works (short version)
 
@@ -365,8 +433,10 @@ id table, the error handling — are in [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 | `hello: protocol error` | the firmware is out of sync; unplug/replug the keyboard |
 | capture never returns | it polls for a finger; press the fingerprint key and **hold it for ~2 s**, brief taps fall between two requests |
 | no image at all any more, `info` still works | the imaging engine is wedged — unplug and replug the keyboard; a USB reset does not help (see [`docs/PROTOCOL.md`](docs/PROTOCOL.md) §4.2) |
-| image looks like a negative | flip `FPI_IMAGE_COLORS_INVERTED` in the libfprint driver |
-| `fprintd-verify` always says `verify-no-match` | expected for now: the frames carry too few minutiae for NBIS at all — see [Matching quality](#matching-quality-verify-no-match) |
+| `verify-no-match` for your own finger | the press hit an area the twelve enrolment presses never covered — re-enrol and move the finger around, or lower `FPCUSB_THRESHOLD` while debugging |
+| `verify-retry-scan` | too little skin on the sensor, press flatter and hold ~2 s |
+| `enroll-retry-scan` / `enroll-remove-and-retry` | the press was empty or identical to a previous one; lift the finger and place it slightly differently |
+| `verify`/`enroll` fails with "please delete it and enrol again" | the stored template predates this driver or came from another sensor — `fprintd-delete "$USER"` and enrol again |
 
 Useful debugging: `fpc-capture -vv`, and `sudo modprobe usbmon` +
 `wireshark` on `usbmon1` to see the raw frames.

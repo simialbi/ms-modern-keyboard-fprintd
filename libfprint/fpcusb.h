@@ -8,10 +8,9 @@
 #pragma once
 
 #include "fpi-device.h"
-#include "fpi-image-device.h"
 
 G_DECLARE_FINAL_TYPE (FpiDeviceFpcUsb, fpi_device_fpcusb, FPI, DEVICE_FPCUSB,
-                      FpImageDevice)
+                      FpDevice)
 
 /* USB */
 #define FPCUSB_INTERFACE   1

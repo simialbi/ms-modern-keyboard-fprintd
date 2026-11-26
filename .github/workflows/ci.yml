@@ -41,8 +41,11 @@ jobs:
       - name: Build
         run: make CC=$CC
 
-      - name: Run offline protocol tests
+      - name: Run offline protocol and matcher tests
         run: make test CC=$CC
+
+      - name: Smoke test the offline matcher evaluation
+        run: make eval-smoke CC=$CC
 
       - name: Smoke test the CLI (no hardware required)
         run: |
@@ -116,13 +119,15 @@ jobs:
         run: |
           cppcheck --std=c11 --enable=warning,performance,portability \
             --inline-suppr --suppress=missingIncludeSystem \
-            -I src src tests
+            -I src src tests tools/fpc_match_eval.c
 
       # Blocking: the tree is clean under the clang analyzer today.
+      # The matcher and the evaluator are included, they parse untrusted
+      # files and are the code that decides about authentication.
       - name: clang static analyzer
         run: |
           make clean
-          scan-build --status-bugs make
+          scan-build --status-bugs make test eval
 
   udev-rule:
     name: udev rule syntax
@@ -169,6 +174,24 @@ jobs:
           test -f build/libfprint/_build/libfprint/libfprint-2.so.2
           grep -q "fpi_device_fpcusb_get_type" \
             build/libfprint/_build/libfprint/fpi-drivers.c
+          # The matcher must be compiled into the library as well, it is a
+          # second source file that has to stay registered in meson.
+          test -f build/libfprint/libfprint/drivers/fpcusb_match.c
+          ls build/libfprint/_build/libfprint/libfprint-drivers.a.p/ \
+            | grep -q "drivers_fpcusb_match\.c\.o"
+
+      # A silently dropped warning here is how the old image-device code
+      # rotted; the rewritten driver must stay clean.
+      - name: Rebuild the driver and fail on warnings
+        run: |
+          touch build/libfprint/libfprint/drivers/fpcusb.c \
+                build/libfprint/libfprint/drivers/fpcusb_match.c
+          ninja -C build/libfprint/_build libfprint/libfprint-drivers.a \
+            2>&1 | tee rebuild.log
+          if grep -qiE "\bwarning\b|\berror\b" rebuild.log; then
+            echo "the fpcusb driver does not compile cleanly"
+            exit 1
+          fi
 
       # fpc-bench links the NBIS matcher of that very checkout.
       - name: Build and smoke test fpc-bench

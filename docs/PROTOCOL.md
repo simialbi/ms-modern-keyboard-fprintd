@@ -190,8 +190,38 @@ runs into its deadline, for any finger.  `libusb_reset_device()` does
 *not* recover it; only unplugging the keyboard does, and even then the
 next capture may be the last one for a while.  Whatever the Windows
 driver does to keep the engine alive (a calibration command among the
-undocumented opcodes `0x0002`-`0x0006`?) is still unknown, and this is
-the most likely reason for verifications failing in practice.
+undocumented opcodes `0x0002`-`0x0006`?) is still unknown.
+
+#### How the drivers poll
+
+Both implementations use the same per-attempt deadline, but they differ
+in *when* they poll:
+
+* `fpc-capture` polls as long as the user asked it to (`loop` runs until
+  Ctrl-C).
+* The libfprint driver polls **only while fprintd is running an
+  operation** — there is no permanent capture loop any more.  Each
+  enrol stage and each verification arms its own deadline (30 s), and
+  between two enrol stages the driver waits for the lift with a 5 s
+  deadline.  Idle means no USB traffic at all, which keeps the sensor
+  far away from the few hundred cycles that wedge it.
+
+#### Recovery sequence of the libfprint driver
+
+A command transfer (`ABORT`/`GET_IMAGE`) that fails is the symptom of the
+wedge; a *timeout while reading the image* is not, it only means "no
+finger yet".  After eight consecutive command failures in one operation
+the driver, in this order:
+
+1. re-runs the `HELLO` handshake (up to 20 attempts, 200 ms apart) and
+   resumes the capture if the sensor answers again,
+2. otherwise issues a USB port reset (`g_usb_device_reset()`),
+3. and finally fails the operation with `FP_DEVICE_ERROR_PROTO` and the
+   message that the keyboard has to be unplugged and plugged back in.
+
+Step 2 is known not to help on this firmware; it is kept because it is
+the last thing the host can try before the user has to act, and the
+explicit error is what turns a hang into something actionable.
 
 ### 4.3 Cancelling
 
@@ -200,6 +230,19 @@ answers the *outstanding* read with a `0x1008` frame instead of image
 data, which is how both the Windows driver and this port break out of the
 blocking wait.  The Windows driver always sends an `ABORT` before a new
 `GET_IMAGE` to make sure the firmware is idle.
+
+Two different aborts are therefore needed, and mixing them up breaks the
+poll loop:
+
+* the **internal** abort that every poll attempt sends before its
+  `GET_IMAGE` (`abort_cmd()` in `src/fpc_usb.c`, state
+  `CAPTURE_SEND_ABORT` in the driver).  Its answer is read and discarded;
+  the input pipe is only drained when that handshake itself fails.
+* the **caller facing** abort that interrupts a running operation
+  (`fpc_abort()`, the `cancel` callback of the driver).  fprintd uses it
+  for its own timeout and for Ctrl-C; a `0x1008` arriving in place of
+  image data is treated as "no image this round", so a cancelled verify
+  leaves the device immediately usable.
 
 ### 4.4 Error notifications
 
@@ -213,8 +256,8 @@ then restarted.
 The Windows stack also contains:
 
 * `KeyboardFingerprintEngine.dll` — the FPC matching algorithm, template
-  creation, and enrolment quality feedback.  On Linux this job is done by
-  libfprint's own NBIS/bozorth3 pipeline, so it is not needed.
+  creation, and enrolment quality feedback.  On Linux this job used to be
+  left to libfprint's own NBIS/bozorth3 pipeline.
 
   NBIS is **not** a free replacement though, and measurement says it
   cannot be made one: it was designed for full sized 500 dpi prints, and
@@ -232,6 +275,13 @@ The Windows stack also contains:
   spot correlate at 0.97 while a different finger stays at or below 0.33
   — but two presses of the same finger that land on different spots can
   drop to 0.17, so one template per finger is not enough.
+
+  That is what `src/fpc_match.c` now does, and the driver is a plain
+  `FpDevice` because of it: the template is a set of up to 16
+  preprocessed frames in a versioned `"FPCT"` blob, and the comparison
+  happens in the driver, not in libfprint.  The algorithm is far simpler
+  than the vendor's (no mosaicking, no template update after a successful
+  verification), so the Windows engine is still the better matcher.
 * A "secure"/match-on-chip path and firmware update commands.  Neither is
   used by the normal enrol/verify flow of this sensor: the firmware only
   streams raw images, the matching happens on the host in both worlds.
@@ -245,6 +295,10 @@ The Windows stack also contains:
   completed, so the libfprint driver must not wait on a single one.
 * The HID keyboard interface (interface 0) is untouched — the keyboard
   keeps working with the normal `usbhid` driver while the sensor is in use.
-* Image polarity: ridges come out dark on this sensor, so the libfprint
-  driver sets `FPI_IMAGE_COLORS_INVERTED`.  If your images look like a
-  photographic negative, flip that flag.
+* Image polarity: ridges come out dark on this sensor.  That mattered for
+  the old image-device driver (`FPI_IMAGE_COLORS_INVERTED`); correlation
+  does not care, because both sides of the comparison come from the same
+  sensor and go through the same preprocessing.  `fpc-capture` writes the
+  raw bytes, so its PGMs and the frames inside a template have identical
+  polarity — which is what makes the offline evaluation comparable to the
+  driver.

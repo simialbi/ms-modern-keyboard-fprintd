@@ -82,11 +82,27 @@ if [ "$UNINSTALL" = 1 ]; then
 		sed -n '/^\//p' "$BUILDDIR/meson-logs/install-log.txt" |
 			while read -r f; do $SUDO rm -f "$f"; done
 	else
-		say "removing $PREFIX/lib/libfprint-2.so*"
+		# No install log (build directory cleaned): remove the files
+		# `meson install` creates, which is everything the library
+		# consists of.  Headers and the .pc file matter because they
+		# would otherwise shadow the distribution package for builds.
+		say "removing the files installed into $PREFIX"
 		$SUDO rm -f "$PREFIX"/lib/libfprint-2.so*
+		$SUDO rm -f "$PREFIX"/lib/pkgconfig/libfprint-2.pc
+		$SUDO rm -rf "$PREFIX"/include/libfprint-2
+		$SUDO rm -f "$PREFIX"/share/metainfo/org.freedesktop.libfprint.metainfo.xml
 	fi
 
 	$SUDO rm -f /etc/udev/rules.d/60-fpc-keyboard.rules
+
+	# Templates enrolled with this driver are unusable without it and
+	# would confuse fprintd-list; prints of other devices stay.
+	if [ -d /var/lib/fprint ]; then
+		say "removing fpcusb templates under /var/lib/fprint"
+		$SUDO find /var/lib/fprint -mindepth 2 -maxdepth 2 \
+			-type d -name fpcusb -exec rm -rf {} + 2>/dev/null || true
+	fi
+
 	$SUDO ldconfig || true
 	$SUDO udevadm control --reload 2>/dev/null || true
 	$SUDO systemctl daemon-reload 2>/dev/null || true
@@ -172,6 +188,16 @@ add_driver()
 {
 	cp "$HERE/fpcusb.c" "$HERE/fpcusb.h" "$SRCDIR/libfprint/drivers/"
 
+	# The correlation matcher is shared with the offline tools and the
+	# unit tests, so what is measured there is literally what ships.
+	cp "$ROOT/src/fpc_match.c" "$SRCDIR/libfprint/drivers/fpcusb_match.c"
+	cp "$ROOT/src/fpc_match.h" "$SRCDIR/libfprint/drivers/fpcusb_match.h"
+	sed -i 's|#include "fpc_match.h"|#include "fpcusb_match.h"|' \
+		"$SRCDIR/libfprint/drivers/fpcusb_match.c"
+	grep -q '#include "fpcusb_match.h"' \
+		"$SRCDIR/libfprint/drivers/fpcusb_match.c" ||
+		die "could not adjust the include of fpcusb_match.c"
+
 	python3 - "$SRCDIR" <<'PY'
 import pathlib, sys
 
@@ -215,7 +241,7 @@ if register(src / 'meson.build', 'drivers_info', "    'fpcusb': {},"):
 
 # 2. libfprint/meson.build: source file of the driver
 if register(src / 'libfprint' / 'meson.build', 'driver_sources',
-            "    'fpcusb': files('drivers/fpcusb.c'),"):
+            "    'fpcusb': files('drivers/fpcusb.c', 'drivers/fpcusb_match.c'),"):
     print('  registered in libfprint/meson.build')
 PY
 }

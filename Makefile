@@ -22,6 +22,8 @@ BUILD   := build
 OBJS    := $(BUILD)/fpc_usb.o $(BUILD)/fpc_capture.o
 TARGET  := $(BUILD)/fpc-capture
 TESTBIN := $(BUILD)/test-frames
+MATCHTEST := $(BUILD)/test-match
+EVAL      := $(BUILD)/fpc-match-eval
 BENCH   := $(BUILD)/fpc-bench
 
 # fpc-bench reuses the NBIS matcher of libfprint, so it needs a checkout
@@ -29,7 +31,7 @@ BENCH   := $(BUILD)/fpc-bench
 LIBFPRINT ?= $(BUILD)/libfprint
 NBIS      := $(LIBFPRINT)/_build/libfprint/libnbis.a
 
-.PHONY: all clean install uninstall test bench
+.PHONY: all clean install uninstall test bench eval eval-smoke
 
 all: $(TARGET)
 
@@ -46,8 +48,23 @@ $(TARGET): $(OBJS)
 $(TESTBIN): tests/test_frames.c $(BUILD)/fpc_usb.o
 	$(CC) $(CFLAGS) $^ -o $@ $(LDLIBS)
 
-test: $(TESTBIN)
+test: $(TESTBIN) $(MATCHTEST)
 	./$(TESTBIN)
+	./$(MATCHTEST)
+
+$(BUILD)/fpc_match.o: src/fpc_match.c src/fpc_match.h | $(BUILD)
+	$(CC) $(CFLAGS) -std=c99 -c $< -o $@
+
+$(MATCHTEST): tests/test_match.c $(BUILD)/fpc_match.o
+	$(CC) $(CFLAGS) -std=c99 $^ -o $@ $(EXTRA_LDLIBS) -lm
+
+eval: $(EVAL)
+
+$(EVAL): tools/fpc_match_eval.c $(BUILD)/fpc_match.o
+	$(CC) $(CFLAGS) -std=c99 $^ -o $@ $(EXTRA_LDLIBS) -lm
+
+eval-smoke: $(EVAL)
+	sh tests/test_match_eval.sh ./$(EVAL) $(BUILD)
 
 # Offline matcher: scores PGM files captured with fpc-capture exactly the
 # way libfprint scores them during a verification.

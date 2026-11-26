@@ -5,20 +5,39 @@
  * The wire protocol was reverse engineered from the Windows UMDF driver
  * KeyboardFingerprintDriver.dll; see ../docs/PROTOCOL.md.
  *
+ * The sensor images 5.6 x 4.4 mm only, which is far too little for the
+ * NBIS minutiae pipeline of libfprint: measured on this hardware a press
+ * yields 0 to 2 minutiae and bozorth3 returns 0 below ten of them, so
+ * every verification failed.  The driver is therefore not an
+ * FpImageDevice: it keeps a set of preprocessed frames per finger and
+ * compares a probe against all of them by normalised cross correlation
+ * (../src/fpc_match.c, installed next to this file as fpcusb_match.c).
+ *
  * Drop this file into libfprint/drivers/fpcusb.c, add 'fpcusb' to the
- * drivers list in meson_options.txt / libfprint/meson.build and rebuild.
+ * drivers list in meson_options.txt / libfprint/meson.build and rebuild;
+ * libfprint/install.sh does all of that.
  *
  * SPDX-License-Identifier: LGPL-2.1-or-later
  */
 
 #define FP_COMPONENT "fpcusb"
 
+#include <stdlib.h>
+
 #include "drivers_api.h"
 #include "fpcusb.h"
+#include "fpcusb_match.h"
+
+typedef enum {
+  FPCUSB_ACTION_NONE,
+  FPCUSB_ACTION_ENROLL,
+  FPCUSB_ACTION_VERIFY,
+  FPCUSB_ACTION_IDENTIFY,
+} FpcUsbAction;
 
 struct _FpiDeviceFpcUsb
 {
-  FpImageDevice parent;
+  FpDevice      parent;
 
   guint16       id;             /* transaction id                     */
   guint16       seq;            /* sequence counter                   */
@@ -31,32 +50,47 @@ struct _FpiDeviceFpcUsb
   gsize         frame_len;
   gsize         frame_off;
 
-  guint         hello_tries;
-  GCancellable *cancellable;    /* cancels the pending image transfer  */
-  gboolean      deactivating;
+  /* the operation currently driven by fprintd */
+  FpcUsbAction  action;
+  gint64        deadline;       /* monotonic microseconds             */
+  gboolean      finger_present;
+  gboolean      wait_for_lift;
+  guint         command_failures;
+  gboolean      recovered;
+
+  /* enrolment state */
+  guint8       *enroll_frames;  /* FPC_TPL_MAX_FRAMES frames          */
+  guint         enroll_count;
+  guint         enroll_stage;
+
+  guint            hello_tries;
+  guint            dump_count;
+  gchar           *dump_dir;
+  gdouble          threshold;
+  fpc_match_params match_params;
 };
 
 /* The sensor ignores the first commands after it has been powered on. */
 #define FPCUSB_HELLO_TRIES 20
 
 /*
- * The FPC1022 in this keyboard images 5.6 x 4.4 mm (112 x 88 pixels at
- * 508 dpi).  That is very little for the NBIS pipeline of libfprint:
- * bozorth3 refuses to compute a score at all when one of the two prints
- * has fewer than MIN_COMPUTABLE_BOZORTH_MINUTIAE (10) minutiae and
- * returns 0, which looks exactly like "verify-no-match" - no matter how
- * low the threshold is.  Enrolment on the other hand never compares
- * anything, so it happily succeeds with the very same images.
- *
- * The frame is therefore stretched over the full grey range and enlarged
- * before it is handed over, the same trick the aes3k and elanspi drivers
- * use for their small sensors.  tools/fpc_bench.c measures the effect of
- * both knobs on real captures.
+ * The firmware answers GET_IMAGE only while a finger is already on the
+ * sensor and never completes a request that was submitted beforehand, so
+ * capturing means polling ABORT + GET_IMAGE.  600 ms per attempt is the
+ * value that works on this hardware; 350 ms caught nothing at all.
  */
-#define FPCUSB_ENLARGE 2
-#define FPCUSB_CLIP    50       /* ignore 1/50 of the pixels per end */
+#define FPCUSB_ATTEMPT_MS   600
+#define FPCUSB_OPERATION_MS 30000
+#define FPCUSB_LIFT_MS      5000
 
-G_DEFINE_TYPE (FpiDeviceFpcUsb, fpi_device_fpcusb, FP_TYPE_IMAGE_DEVICE)
+#define FPCUSB_ENROLL_STAGES   12
+#define FPCUSB_MIN_COVERAGE    0.10
+#define FPCUSB_DUPLICATE_SCORE 0.95
+
+/* Consecutive command failures that are treated as a wedged engine. */
+#define FPCUSB_WEDGE_FAILURES 8
+
+G_DEFINE_TYPE (FpiDeviceFpcUsb, fpi_device_fpcusb, FP_TYPE_DEVICE)
 
 /* ------------------------------------------------------------------ */
 /* helpers                                                             */
@@ -91,6 +125,12 @@ put16 (guint8 *p, guint16 v)
   p[1] = (guint8) (v >> 8);
 }
 
+static gsize
+fpcusb_pixels (FpiDeviceFpcUsb *self)
+{
+  return (gsize) self->width * self->height;
+}
+
 static void
 fpcusb_geometry (FpiDeviceFpcUsb *self)
 {
@@ -111,54 +151,97 @@ fpcusb_geometry (FpiDeviceFpcUsb *self)
 }
 
 /*
- * Spread the used part of the histogram over the full range.  The sensor
- * only ever uses a fraction of it and NBIS drops every block whose
- * contrast stays below a fixed delta, so without this most of the image
- * never contributes a single minutia.
+ * The search window, the rotation range and the decision threshold come
+ * from the FAR/FRR measurement in tools/fpc_match_eval.c; they stay
+ * overridable so that a field problem can be investigated without a
+ * rebuild.
  */
 static void
-fpcusb_normalize (guint8 *data, gsize len)
+fpcusb_configure_matcher (FpiDeviceFpcUsb *self)
 {
-  guint hist[256] = { 0 };
-  gsize cut = len / FPCUSB_CLIP;
-  gsize acc = 0;
-  gint lo = 0, hi = 255;
-  gdouble scale;
+  const gchar *env;
 
-  for (gsize i = 0; i < len; i++)
-    hist[data[i]]++;
+  fpc_match_default_params (&self->match_params, self->width, self->height);
+  self->threshold = FPC_MATCH_THRESHOLD_DEFAULT;
 
-  for (gint i = 0; i < 256; i++)
+  env = g_getenv ("FPCUSB_THRESHOLD");
+  if (env)
     {
-      acc += hist[i];
-      if (acc > cut)
+      gdouble value = g_ascii_strtod (env, NULL);
+
+      if (value > 0.0 && value <= 1.0)
+        self->threshold = value;
+      else
+        fp_warn ("ignoring FPCUSB_THRESHOLD=%s, expected (0, 1]", env);
+    }
+
+  env = g_getenv ("FPCUSB_MAX_SHIFT");
+  if (env)
+    {
+      gint64 value = g_ascii_strtoll (env, NULL, 10);
+
+      if (value > 0 && value < self->width && value < self->height)
         {
-          lo = i;
-          break;
+          self->match_params.max_shift_x = (gint) value;
+          self->match_params.max_shift_y = (gint) value;
+        }
+      else
+        {
+          fp_warn ("ignoring FPCUSB_MAX_SHIFT=%s, expected 1..%u", env,
+                   MIN (self->width, self->height) - 1);
         }
     }
 
-  acc = 0;
-  for (gint i = 255; i >= 0; i--)
+  env = g_getenv ("FPCUSB_ROT_STEPS");
+  if (env)
     {
-      acc += hist[i];
-      if (acc > cut)
-        {
-          hi = i;
-          break;
-        }
+      gint64 value = g_ascii_strtoll (env, NULL, 10);
+
+      if (value >= 0 && value <= 16)
+        self->match_params.rot_steps = (gint) value;
+      else
+        fp_warn ("ignoring FPCUSB_ROT_STEPS=%s, expected 0..16", env);
     }
 
-  if (hi <= lo)
+  g_clear_pointer (&self->dump_dir, g_free);
+  env = g_getenv ("FPCUSB_DUMP_DIR");
+  if (env && *env)
+    self->dump_dir = g_strdup (env);
+
+  fp_dbg ("matcher: threshold %.3f, shift %d/%d, rotation %d x %.1f deg",
+          self->threshold, self->match_params.max_shift_x,
+          self->match_params.max_shift_y, self->match_params.rot_steps,
+          self->match_params.rot_step_deg);
+}
+
+/* Diagnostic dump of a captured frame; only active with FPCUSB_DUMP_DIR. */
+static void
+fpcusb_dump_frame (FpiDeviceFpcUsb *self, const guint8 *pixels)
+{
+  g_autofree gchar *path = NULL;
+  g_autofree gchar *header = NULL;
+  g_autoptr(GError) error = NULL;
+  g_autoptr(GByteArray) pgm = NULL;
+
+  if (!self->dump_dir)
     return;
 
-  scale = 255.0 / (hi - lo);
-  for (gsize i = 0; i < len; i++)
+  if (g_mkdir_with_parents (self->dump_dir, 0700) != 0)
     {
-      gdouble v = (data[i] - lo) * scale;
-
-      data[i] = (guint8) CLAMP (v, 0.0, 255.0);
+      fp_warn ("cannot create %s", self->dump_dir);
+      g_clear_pointer (&self->dump_dir, g_free);
+      return;
     }
+
+  path = g_strdup_printf ("%s/fpcusb-%04u.pgm", self->dump_dir,
+                          ++self->dump_count);
+  header = g_strdup_printf ("P5\n%u %u\n255\n", self->width, self->height);
+  pgm = g_byte_array_new ();
+  g_byte_array_append (pgm, (const guint8 *) header, strlen (header));
+  g_byte_array_append (pgm, pixels, fpcusb_pixels (self));
+
+  if (!g_file_set_contents (path, (const gchar *) pgm->data, pgm->len, &error))
+    fp_warn ("cannot write %s: %s", path, error->message);
 }
 
 /* Build an 8 byte command frame. */
@@ -238,6 +321,68 @@ fpcusb_check (FpiDeviceFpcUsb *self, const guint8 *f, gsize len, guint16 op,
     }
   self->seq = get16 (f + len - 4);
   return TRUE;
+}
+
+/* ------------------------------------------------------------------ */
+/* template codec                                                      */
+/* ------------------------------------------------------------------ */
+
+static GVariant *
+fpcusb_template_to_variant (FpiDeviceFpcUsb *self)
+{
+  g_autofree guint8 *blob = NULL;
+  gsize len = fpc_match_template_size (self->width, self->height,
+                                       self->enroll_count);
+
+  if (len == 0)
+    return NULL;
+
+  blob = g_malloc (len);
+  if (fpc_match_template_serialize (blob, len, self->hwid, self->width,
+                                    self->height, self->enroll_count,
+                                    self->enroll_frames) != 0)
+    return NULL;
+
+  return g_variant_new_fixed_array (G_VARIANT_TYPE_BYTE, blob, len, 1);
+}
+
+/*
+ * Return the frames of a stored print, or NULL with an error explaining
+ * why they cannot be used (wrong sensor, wrong geometry, old format).
+ */
+static const guint8 *
+fpcusb_template_frames (FpiDeviceFpcUsb *self, FpPrint *print,
+                        GVariant **holder, guint *count, GError **error)
+{
+  g_autoptr(GVariant) data = NULL;
+  const guint8 *blob;
+  const guint8 *frames = NULL;
+  fpc_tpl_header header;
+  gsize len = 0;
+
+  g_object_get (print, "fpi-data", &data, NULL);
+  if (!data || !g_variant_is_of_type (data, G_VARIANT_TYPE ("ay")))
+    {
+      g_propagate_error (error, fpi_device_error_new_msg
+                           (FP_DEVICE_ERROR_DATA_INVALID,
+                           "no fpcusb template in this print, please enrol again"));
+      return NULL;
+    }
+
+  blob = g_variant_get_fixed_array (data, &len, 1);
+  if (fpc_match_template_parse (blob, len, self->hwid, self->width,
+                               self->height, &header, &frames) != 0)
+    {
+      g_propagate_error (error, fpi_device_error_new_msg
+                           (FP_DEVICE_ERROR_DATA_INVALID,
+                           "template does not match this sensor or format, "
+                           "please delete it and enrol again"));
+      return NULL;
+    }
+
+  *holder = g_steal_pointer (&data);
+  *count = header.count;
+  return frames;
 }
 
 /* ------------------------------------------------------------------ */
@@ -327,40 +472,45 @@ open_run_state (FpiSsm *ssm, FpDevice *dev)
 static void
 open_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
-  fpi_image_device_open_complete (FP_IMAGE_DEVICE (dev), error);
+  FpiDeviceFpcUsb *self = FPI_DEVICE_FPCUSB (dev);
+
+  if (!error)
+    fpcusb_configure_matcher (self);
+
+  fpi_device_open_complete (dev, error);
 }
 
 static void
-fpcusb_open (FpImageDevice *dev)
+fpcusb_open (FpDevice *dev)
 {
   FpiDeviceFpcUsb *self = FPI_DEVICE_FPCUSB (dev);
   GError *error = NULL;
 
-  if (!g_usb_device_claim_interface (fpi_device_get_usb_device (FP_DEVICE (dev)),
+  if (!g_usb_device_claim_interface (fpi_device_get_usb_device (dev),
                                      FPCUSB_INTERFACE, 0, &error))
     {
-      fpi_image_device_open_complete (dev, error);
+      fpi_device_open_complete (dev, error);
       return;
     }
 
   self->hello_tries = 0;
 
-  fpi_ssm_start (fpi_ssm_new (FP_DEVICE (dev), open_run_state,
-                              OPEN_NUM_STATES), open_done);
+  fpi_ssm_start (fpi_ssm_new (dev, open_run_state, OPEN_NUM_STATES),
+                 open_done);
 }
 
 static void
-fpcusb_close (FpImageDevice *dev)
+fpcusb_close (FpDevice *dev)
 {
   GError *error = NULL;
 
-  g_usb_device_release_interface (fpi_device_get_usb_device (FP_DEVICE (dev)),
+  g_usb_device_release_interface (fpi_device_get_usb_device (dev),
                                   FPCUSB_INTERFACE, 0, &error);
-  fpi_image_device_close_complete (dev, error);
+  fpi_device_close_complete (dev, error);
 }
 
 /* ------------------------------------------------------------------ */
-/* capture loop                                                        */
+/* capture: poll until a finger is on the sensor                       */
 /* ------------------------------------------------------------------ */
 
 enum capture_states {
@@ -373,10 +523,20 @@ enum capture_states {
   CAPTURE_NUM_STATES,
 };
 
+static void fpcusb_operation_failed (FpDevice *dev, GError *error);
+static void fpcusb_frame_captured (FpDevice *dev);
+static void fpcusb_lift_detected (FpDevice *dev);
+
+static gboolean
+fpcusb_deadline_passed (FpiDeviceFpcUsb *self)
+{
+  return g_get_monotonic_time () >= self->deadline;
+}
+
 /*
  * Every capture starts by cancelling whatever the firmware may still be
  * doing; the reply to that abort is swallowed here so that the image
- * transfer starts on a clean pipe (this mirrors fpc-capture).
+ * transfer starts on a clean pipe (this mirrors fpc_capture).
  */
 static void
 capture_abort_cb (FpiUsbTransfer *transfer, FpDevice *dev,
@@ -386,10 +546,35 @@ capture_abort_cb (FpiUsbTransfer *transfer, FpDevice *dev,
 
   g_autoptr(GError) local_error = error;
 
+  if (g_error_matches (local_error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+    {
+      fpi_ssm_mark_failed (transfer->ssm, g_steal_pointer (&local_error));
+      return;
+    }
+
   if (!local_error && transfer->actual_length >= 10)
     self->seq = get16 (transfer->buffer + transfer->actual_length - 4);
 
-  fpi_ssm_next_state_delayed (transfer->ssm, 15);
+  fpi_ssm_next_state_delayed (transfer->ssm, 5);
+}
+
+/* A failed command is the symptom of the wedged imaging engine. */
+static void
+capture_command_cb (FpiUsbTransfer *transfer, FpDevice *dev,
+                    gpointer user_data, GError *error)
+{
+  FpiDeviceFpcUsb *self = FPI_DEVICE_FPCUSB (dev);
+
+  if (error)
+    {
+      if (!g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+        self->command_failures++;
+      fpi_ssm_mark_failed (transfer->ssm, error);
+      return;
+    }
+
+  self->command_failures = 0;
+  fpi_ssm_next_state (transfer->ssm);
 }
 
 static void
@@ -401,9 +586,35 @@ capture_first_cb (FpiUsbTransfer *transfer, FpDevice *dev,
 
   if (error)
     {
+      /* A timeout simply means that no finger is on the sensor yet. */
+      if (g_error_matches (error, G_USB_DEVICE_ERROR,
+                           G_USB_DEVICE_ERROR_TIMED_OUT))
+        {
+          g_clear_error (&error);
+
+          if (self->wait_for_lift)
+            {
+              fpi_ssm_mark_completed (transfer->ssm);
+              return;
+            }
+
+          if (fpcusb_deadline_passed (self))
+            {
+              fpi_ssm_mark_failed (transfer->ssm,
+                                   fpi_device_retry_new_msg
+                                     (FP_DEVICE_RETRY_GENERAL,
+                                     "no finger on the sensor"));
+              return;
+            }
+
+          fpi_ssm_jump_to_state (transfer->ssm, CAPTURE_SEND_ABORT);
+          return;
+        }
+
       fpi_ssm_mark_failed (transfer->ssm, error);
       return;
     }
+
   if (transfer->actual_length < 6)
     {
       fpi_ssm_mark_failed (transfer->ssm,
@@ -415,17 +626,26 @@ capture_first_cb (FpiUsbTransfer *transfer, FpDevice *dev,
   op = get16 (transfer->buffer);
   if (op == FPCUSB_CMD_ERROR || op == (FPCUSB_CMD_ERROR | FPCUSB_RESP))
     {
-      /* unsolicited error frame: acknowledge it and start over */
+      /* unsolicited error frame: acknowledge it and poll again */
       fpcusb_ack_error (dev, self);
-      fpi_ssm_mark_failed (transfer->ssm,
-                           fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL));
+      if (fpcusb_deadline_passed (self))
+        {
+          fpi_ssm_mark_failed (transfer->ssm,
+                               fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL));
+          return;
+        }
+      fpi_ssm_jump_to_state_delayed (transfer->ssm, CAPTURE_SEND_ABORT, 20);
       return;
     }
   if (op == (FPCUSB_CMD_ABORT | FPCUSB_RESP))
     {
-      /* aborted: silently restart the capture loop */
-      fpi_ssm_mark_failed (transfer->ssm,
-                           fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL));
+      if (fpcusb_deadline_passed (self))
+        {
+          fpi_ssm_mark_failed (transfer->ssm,
+                               fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL));
+          return;
+        }
+      fpi_ssm_jump_to_state (transfer->ssm, CAPTURE_SEND_ABORT);
       return;
     }
   if (op != (FPCUSB_CMD_IMAGE | FPCUSB_RESP) || get16 (transfer->buffer + 2))
@@ -438,8 +658,12 @@ capture_first_cb (FpiUsbTransfer *transfer, FpDevice *dev,
       return;
     }
 
-  /* A finger is on the sensor - tell the state machine of libfprint. */
-  fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), TRUE);
+  if (!self->finger_present)
+    {
+      self->finger_present = TRUE;
+      fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_PRESENT,
+                                               FP_FINGER_STATUS_NEEDED);
+    }
 
   memcpy (self->frame, transfer->buffer, transfer->actual_length);
   self->frame_off = transfer->actual_length;
@@ -486,17 +710,16 @@ static void
 capture_run_state (FpiSsm *ssm, FpDevice *dev)
 {
   FpiDeviceFpcUsb *self = FPI_DEVICE_FPCUSB (dev);
+  GCancellable *cancellable = fpi_device_get_cancellable (dev);
   FpiUsbTransfer *t;
   GError *error = NULL;
-  FpImage *img, *raw;
-  gsize pixels;
   gsize want;
 
-  if (self->deactivating)
+  if (g_cancellable_is_cancelled (cancellable))
     {
       fpi_ssm_mark_failed (ssm, g_error_new_literal (G_IO_ERROR,
                                                      G_IO_ERROR_CANCELLED,
-                                                     "deactivating"));
+                                                     "cancelled"));
       return;
     }
 
@@ -506,33 +729,34 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
       self->seq++;
       t = fpcusb_cmd_transfer (dev, self, FPCUSB_CMD_ABORT);
       t->ssm = ssm;
-      fpi_usb_transfer_submit (t, 1000, NULL, fpi_ssm_usb_transfer_cb, NULL);
+      fpi_usb_transfer_submit (t, 1000, cancellable, capture_command_cb, NULL);
       break;
 
     case CAPTURE_RECV_ABORT:
       t = fpi_usb_transfer_new (dev);
       t->ssm = ssm;
       fpi_usb_transfer_fill_bulk (t, FPCUSB_EP_IN, 10);
-      fpi_usb_transfer_submit (t, 500, NULL, capture_abort_cb, NULL);
+      fpi_usb_transfer_submit (t, 500, cancellable, capture_abort_cb, NULL);
       break;
 
     case CAPTURE_SEND_CMD:
-      self->frame_len = (gsize) self->width * self->height + 12;
+      self->frame_len = fpcusb_pixels (self) + 12;
       g_free (self->frame);
       self->frame = g_malloc0 (self->frame_len);
       self->frame_off = 0;
       self->seq++;
       t = fpcusb_cmd_transfer (dev, self, FPCUSB_CMD_IMAGE);
       t->ssm = ssm;
-      fpi_usb_transfer_submit (t, 1000, NULL, fpi_ssm_usb_transfer_cb, NULL);
+      fpi_usb_transfer_submit (t, 1000, cancellable, capture_command_cb, NULL);
       break;
 
     case CAPTURE_FIRST_PACKET:
-      /* No timeout: the device answers when a finger touches the sensor. */
+      /* The device answers only while a finger is on the sensor, so a
+       * timeout here is the normal "not yet" and not an error. */
       t = fpi_usb_transfer_new (dev);
       t->ssm = ssm;
       fpi_usb_transfer_fill_bulk (t, FPCUSB_EP_IN, FPCUSB_PACKET);
-      fpi_usb_transfer_submit (t, 0, self->cancellable,
+      fpi_usb_transfer_submit (t, FPCUSB_ATTEMPT_MS, cancellable,
                                capture_first_cb, NULL);
       break;
 
@@ -543,7 +767,7 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
       t = fpi_usb_transfer_new (dev);
       t->ssm = ssm;
       fpi_usb_transfer_fill_bulk (t, FPCUSB_EP_IN, want);
-      fpi_usb_transfer_submit (t, 5000, NULL, capture_next_cb, NULL);
+      fpi_usb_transfer_submit (t, 5000, cancellable, capture_next_cb, NULL);
       break;
 
     case CAPTURE_FINISH:
@@ -554,25 +778,19 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
           return;
         }
 
-      pixels = (gsize) self->width * self->height;
-      raw = fp_image_new (self->width, self->height);
-      raw->flags |= FPI_IMAGE_COLORS_INVERTED;
-      memcpy (raw->data, self->frame + 6, pixels);
-      fpcusb_normalize (raw->data, pixels);
-
-      if (FPCUSB_ENLARGE > 1)
+      /* While waiting for the lift an image means the finger is still
+       * there, so keep polling until the sensor stops answering. */
+      if (self->wait_for_lift)
         {
-          img = fpi_image_resize (raw, FPCUSB_ENLARGE, FPCUSB_ENLARGE);
-          img->ppmm = raw->ppmm * FPCUSB_ENLARGE;
-          g_object_unref (raw);
-        }
-      else
-        {
-          img = raw;
+          if (fpcusb_deadline_passed (self))
+            {
+              fpi_ssm_mark_completed (ssm);
+              return;
+            }
+          fpi_ssm_jump_to_state_delayed (ssm, CAPTURE_SEND_ABORT, 20);
+          return;
         }
 
-      fpi_image_device_image_captured (FP_IMAGE_DEVICE (dev), img);
-      fpi_image_device_report_finger_status (FP_IMAGE_DEVICE (dev), FALSE);
       fpi_ssm_mark_completed (ssm);
       break;
 
@@ -586,70 +804,446 @@ capture_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
   FpiDeviceFpcUsb *self = FPI_DEVICE_FPCUSB (dev);
 
-  if (self->deactivating)
+  if (self->wait_for_lift)
     {
-      g_clear_error (&error);
-      self->deactivating = FALSE;
-      fpi_image_device_deactivate_complete (FP_IMAGE_DEVICE (dev), NULL);
-      return;
-    }
+      self->wait_for_lift = FALSE;
 
-  /* A retry error means "no usable image this time" - just listen again. */
-  if (error && error->domain == FP_DEVICE_RETRY)
-    {
-      fp_dbg ("capture retry: %s", error->message);
+      if (error && g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
+        {
+          fpcusb_operation_failed (dev, error);
+          return;
+        }
+
+      /* A lift that cannot be observed must not abort the enrolment. */
       g_clear_error (&error);
+
+      if (self->finger_present)
+        {
+          self->finger_present = FALSE;
+          fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_NEEDED,
+                                                   FP_FINGER_STATUS_PRESENT);
+        }
+
+      fpcusb_lift_detected (dev);
+      return;
     }
 
   if (error)
     {
-      fpi_image_device_session_error (FP_IMAGE_DEVICE (dev), error);
+      fpcusb_operation_failed (dev, error);
       return;
     }
 
-  /* keep listening for the next finger */
+  fpcusb_frame_captured (dev);
+}
+
+static void
+fpcusb_capture_start (FpDevice *dev, gboolean wait_for_lift)
+{
+  FpiDeviceFpcUsb *self = FPI_DEVICE_FPCUSB (dev);
+  gint timeout_ms = wait_for_lift ? FPCUSB_LIFT_MS : FPCUSB_OPERATION_MS;
+
+  self->wait_for_lift = wait_for_lift;
+  self->deadline = g_get_monotonic_time () + timeout_ms * G_TIME_SPAN_MILLISECOND;
+
+  if (!wait_for_lift && !self->finger_present)
+    fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_NEEDED,
+                                             FP_FINGER_STATUS_NONE);
+
   fpi_ssm_start (fpi_ssm_new (dev, capture_run_state, CAPTURE_NUM_STATES),
                  capture_done);
 }
 
 /* ------------------------------------------------------------------ */
-/* activate / deactivate                                               */
+/* wedge recovery                                                      */
 /* ------------------------------------------------------------------ */
 
 static void
-fpcusb_activate (FpImageDevice *dev)
+recover_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 {
   FpiDeviceFpcUsb *self = FPI_DEVICE_FPCUSB (dev);
 
-  self->deactivating = FALSE;
-  g_clear_object (&self->cancellable);
-  self->cancellable = g_cancellable_new ();
-  fpi_image_device_activate_complete (dev, NULL);
-  fpi_ssm_start (fpi_ssm_new (FP_DEVICE (dev), capture_run_state,
-                              CAPTURE_NUM_STATES), capture_done);
+  if (error)
+    {
+      g_clear_error (&error);
+
+      /* HELLO did not help either: a port reset is the last thing the
+       * host can do before the user has to replug the keyboard. */
+      if (!g_usb_device_reset (fpi_device_get_usb_device (dev), &error))
+        g_clear_error (&error);
+
+      fpcusb_operation_failed (dev, fpi_device_error_new_msg
+                                 (FP_DEVICE_ERROR_PROTO,
+                                 "the fingerprint sensor stopped answering; "
+                                 "unplug the keyboard and plug it back in"));
+      return;
+    }
+
+  self->command_failures = 0;
+  fpcusb_capture_start (dev, FALSE);
+}
+
+/*
+ * The imaging engine of this firmware can stop answering GET_IMAGE while
+ * HELLO still works.  Re-running the handshake is cheap and sometimes
+ * enough; if it is not, the operation fails with an actionable message
+ * instead of polling forever.
+ */
+static gboolean
+fpcusb_try_recover (FpDevice *dev)
+{
+  FpiDeviceFpcUsb *self = FPI_DEVICE_FPCUSB (dev);
+
+  if (self->action == FPCUSB_ACTION_NONE || self->recovered ||
+      self->command_failures < FPCUSB_WEDGE_FAILURES)
+    return FALSE;
+
+  fp_warn ("the sensor stopped answering, re-initialising it");
+  self->recovered = TRUE;
+  self->hello_tries = 0;
+  fpi_ssm_start (fpi_ssm_new (dev, open_run_state, OPEN_NUM_STATES),
+                 recover_done);
+  return TRUE;
+}
+
+/* ------------------------------------------------------------------ */
+/* operations                                                          */
+/* ------------------------------------------------------------------ */
+
+static void
+fpcusb_operation_reset (FpiDeviceFpcUsb *self)
+{
+  self->action = FPCUSB_ACTION_NONE;
+  self->wait_for_lift = FALSE;
+  self->finger_present = FALSE;
+  self->recovered = FALSE;
+  self->enroll_count = 0;
+  self->enroll_stage = 0;
+  g_clear_pointer (&self->enroll_frames, g_free);
 }
 
 static void
-fpcusb_deactivate (FpImageDevice *dev)
+fpcusb_operation_failed (FpDevice *dev, GError *error)
+{
+  FpiDeviceFpcUsb *self = FPI_DEVICE_FPCUSB (dev);
+  FpcUsbAction action = self->action;
+  gboolean was_present = self->finger_present;
+
+  /* The sensor stopped answering altogether: try to revive it instead of
+   * handing the user a bare USB error. */
+  if (error && !g_error_matches (error, G_IO_ERROR, G_IO_ERROR_CANCELLED) &&
+      fpcusb_try_recover (dev))
+    {
+      g_clear_error (&error);
+      return;
+    }
+
+  fpcusb_operation_reset (self);
+
+  if (was_present)
+    fpi_device_report_finger_status_changes (dev, FP_FINGER_STATUS_NONE,
+                                             FP_FINGER_STATUS_PRESENT);
+
+  switch (action)
+    {
+    case FPCUSB_ACTION_ENROLL:
+      fpi_device_enroll_complete (dev, NULL, error);
+      break;
+
+    case FPCUSB_ACTION_VERIFY:
+      if (error && error->domain == FP_DEVICE_RETRY)
+        {
+          fpi_device_verify_report (dev, FPI_MATCH_ERROR, NULL, error);
+          fpi_device_verify_complete (dev, NULL);
+        }
+      else
+        {
+          fpi_device_verify_complete (dev, error);
+        }
+      break;
+
+    case FPCUSB_ACTION_IDENTIFY:
+      if (error && error->domain == FP_DEVICE_RETRY)
+        {
+          fpi_device_identify_report (dev, NULL, NULL, error);
+          fpi_device_identify_complete (dev, NULL);
+        }
+      else
+        {
+          fpi_device_identify_complete (dev, error);
+        }
+      break;
+
+    case FPCUSB_ACTION_NONE:
+    default:
+      fpi_device_action_error (dev, error);
+      break;
+    }
+}
+
+/* Hand the freshly captured frame over to the matcher. */
+static guint8 *
+fpcusb_take_frame (FpiDeviceFpcUsb *self)
+{
+  gsize pixels = fpcusb_pixels (self);
+  guint8 *frame = g_malloc (pixels);
+
+  memcpy (frame, self->frame + 6, pixels);
+  fpc_match_preprocess (frame, self->width, self->height);
+  return frame;
+}
+
+static void
+fpcusb_enroll_frame (FpDevice *dev, guint8 *frame)
+{
+  FpiDeviceFpcUsb *self = FPI_DEVICE_FPCUSB (dev);
+  gsize pixels = fpcusb_pixels (self);
+  gdouble coverage = fpc_match_coverage (frame, self->width, self->height);
+
+  if (coverage < FPCUSB_MIN_COVERAGE)
+    {
+      fp_dbg ("enrol frame rejected: coverage %.3f", coverage);
+      fpi_device_enroll_progress (dev, self->enroll_stage, NULL,
+                                  fpi_device_retry_new (FP_DEVICE_RETRY_CENTER_FINGER));
+      fpcusb_capture_start (dev, TRUE);
+      return;
+    }
+
+  if (self->enroll_count > 0)
+    {
+      gdouble score = fpc_match_score_set (frame, self->enroll_frames,
+                                           self->enroll_count,
+                                           &self->match_params, NULL);
+
+      if (score >= FPCUSB_DUPLICATE_SCORE)
+        {
+          fp_dbg ("enrol frame rejected: duplicate (score %.3f)", score);
+          fpi_device_enroll_progress (dev, self->enroll_stage, NULL,
+                                      fpi_device_retry_new (FP_DEVICE_RETRY_REMOVE_FINGER));
+          fpcusb_capture_start (dev, TRUE);
+          return;
+        }
+    }
+
+  if (self->enroll_count < FPC_TPL_MAX_FRAMES)
+    memcpy (self->enroll_frames + (gsize) self->enroll_count++ * pixels,
+            frame, pixels);
+
+  self->enroll_stage++;
+  fpi_device_enroll_progress (dev, self->enroll_stage, NULL, NULL);
+
+  if (self->enroll_stage < FPCUSB_ENROLL_STAGES)
+    {
+      fpcusb_capture_start (dev, TRUE);
+      return;
+    }
+
+  {
+    FpPrint *print = NULL;
+    GVariant *data = fpcusb_template_to_variant (self);
+
+    if (!data)
+      {
+        fpcusb_operation_failed (dev, fpi_device_error_new_msg
+                                   (FP_DEVICE_ERROR_GENERAL,
+                                   "cannot serialise the template"));
+        return;
+      }
+
+    fpi_device_get_enroll_data (dev, &print);
+    fpi_print_set_type (print, FPI_PRINT_RAW);
+    fpi_print_set_device_stored (print, FALSE);
+    g_object_set (print, "fpi-data", data, NULL);
+
+    fpcusb_operation_reset (self);
+    fpi_device_enroll_complete (dev, g_object_ref (print), NULL);
+  }
+}
+
+static void
+fpcusb_verify_frame (FpDevice *dev, guint8 *frame)
+{
+  FpiDeviceFpcUsb *self = FPI_DEVICE_FPCUSB (dev);
+  gdouble coverage = fpc_match_coverage (frame, self->width, self->height);
+  GError *error = NULL;
+  FpPrint *print = NULL;
+
+  g_autoptr(GVariant) holder = NULL;
+  const guint8 *frames;
+  guint count = 0;
+  gdouble score;
+
+  /* Not enough skin on the sensor: this is a retry, never a no-match. */
+  if (coverage < FPCUSB_MIN_COVERAGE)
+    {
+      fpcusb_operation_failed (dev, fpi_device_retry_new_msg
+                                 (FP_DEVICE_RETRY_CENTER_FINGER,
+                                 "too little contact with the sensor"));
+      return;
+    }
+
+  fpi_device_get_verify_data (dev, &print);
+  frames = fpcusb_template_frames (self, print, &holder, &count, &error);
+  if (!frames)
+    {
+      fpcusb_operation_failed (dev, error);
+      return;
+    }
+
+  score = fpc_match_score_set (frame, frames, count, &self->match_params, NULL);
+  fp_dbg ("verify score %.3f (threshold %.3f, %u frames)", score,
+          self->threshold, count);
+
+  fpcusb_operation_reset (self);
+  fpi_device_verify_report (dev,
+                            score >= self->threshold ? FPI_MATCH_SUCCESS
+                                                     : FPI_MATCH_FAIL,
+                            NULL, NULL);
+  fpi_device_verify_complete (dev, NULL);
+}
+
+static void
+fpcusb_identify_frame (FpDevice *dev, guint8 *frame)
+{
+  FpiDeviceFpcUsb *self = FPI_DEVICE_FPCUSB (dev);
+  gdouble coverage = fpc_match_coverage (frame, self->width, self->height);
+  GPtrArray *prints = NULL;
+  FpPrint *best = NULL;
+  gdouble best_score = -1.0;
+
+  if (coverage < FPCUSB_MIN_COVERAGE)
+    {
+      fpcusb_operation_failed (dev, fpi_device_retry_new_msg
+                                 (FP_DEVICE_RETRY_CENTER_FINGER,
+                                 "too little contact with the sensor"));
+      return;
+    }
+
+  fpi_device_get_identify_data (dev, &prints);
+
+  for (guint i = 0; prints && i < prints->len; i++)
+    {
+      FpPrint *print = g_ptr_array_index (prints, i);
+
+      g_autoptr(GVariant) holder = NULL;
+      g_autoptr(GError) error = NULL;
+      const guint8 *frames;
+      guint count = 0;
+      gdouble score;
+
+      frames = fpcusb_template_frames (self, print, &holder, &count, &error);
+      if (!frames)
+        {
+          fp_dbg ("skipping print %u: %s", i, error->message);
+          continue;
+        }
+
+      score = fpc_match_score_set (frame, frames, count,
+                                   &self->match_params, NULL);
+      if (score > best_score)
+        {
+          best_score = score;
+          best = print;
+        }
+    }
+
+  fp_dbg ("identify best score %.3f (threshold %.3f)", best_score,
+          self->threshold);
+
+  fpcusb_operation_reset (self);
+  fpi_device_identify_report (dev,
+                              best_score >= self->threshold ? best : NULL,
+                              NULL, NULL);
+  fpi_device_identify_complete (dev, NULL);
+}
+
+static void
+fpcusb_frame_captured (FpDevice *dev)
+{
+  FpiDeviceFpcUsb *self = FPI_DEVICE_FPCUSB (dev);
+
+  g_autofree guint8 *frame = fpcusb_take_frame (self);
+
+  fpcusb_dump_frame (self, frame);
+
+  switch (self->action)
+    {
+    case FPCUSB_ACTION_ENROLL:
+      fpcusb_enroll_frame (dev, frame);
+      break;
+
+    case FPCUSB_ACTION_VERIFY:
+      fpcusb_verify_frame (dev, frame);
+      break;
+
+    case FPCUSB_ACTION_IDENTIFY:
+      fpcusb_identify_frame (dev, frame);
+      break;
+
+    case FPCUSB_ACTION_NONE:
+    default:
+      fp_warn ("frame captured without an active operation");
+      break;
+    }
+}
+
+/* The finger was lifted, the next enrolment stage can start. */
+static void
+fpcusb_lift_detected (FpDevice *dev)
+{
+  FpiDeviceFpcUsb *self = FPI_DEVICE_FPCUSB (dev);
+
+  if (self->action != FPCUSB_ACTION_ENROLL)
+    return;
+
+  fpcusb_capture_start (dev, FALSE);
+}
+
+static void
+fpcusb_enroll (FpDevice *dev)
+{
+  FpiDeviceFpcUsb *self = FPI_DEVICE_FPCUSB (dev);
+
+  fpcusb_operation_reset (self);
+  self->action = FPCUSB_ACTION_ENROLL;
+  self->enroll_frames = g_malloc0 (fpcusb_pixels (self) * FPC_TPL_MAX_FRAMES);
+
+  fpcusb_capture_start (dev, FALSE);
+}
+
+static void
+fpcusb_verify (FpDevice *dev)
+{
+  FpiDeviceFpcUsb *self = FPI_DEVICE_FPCUSB (dev);
+
+  fpcusb_operation_reset (self);
+  self->action = FPCUSB_ACTION_VERIFY;
+
+  fpcusb_capture_start (dev, FALSE);
+}
+
+static void
+fpcusb_identify (FpDevice *dev)
+{
+  FpiDeviceFpcUsb *self = FPI_DEVICE_FPCUSB (dev);
+
+  fpcusb_operation_reset (self);
+  self->action = FPCUSB_ACTION_IDENTIFY;
+
+  fpcusb_capture_start (dev, FALSE);
+}
+
+static void
+fpcusb_cancel (FpDevice *dev)
 {
   FpiDeviceFpcUsb *self = FPI_DEVICE_FPCUSB (dev);
   FpiUsbTransfer *t;
 
-  self->deactivating = TRUE;
-
-  /* Unblock the pending image transfer: the firmware answers a pending
+  /* Unblock a pending image transfer: the firmware answers a pending
    * GET_IMAGE with an ABORT frame as soon as opcode 8 arrives. */
   self->seq++;
-  t = fpcusb_cmd_transfer (FP_DEVICE (dev), self, FPCUSB_CMD_ABORT);
+  t = fpcusb_cmd_transfer (dev, self, FPCUSB_CMD_ABORT);
   fpi_usb_transfer_submit (t, 1000, NULL, fpcusb_ignore_cb, NULL);
-
-  g_cancellable_cancel (self->cancellable);
-}
-
-static void
-fpcusb_change_state (FpImageDevice *dev, FpiImageDeviceState state)
-{
-  /* The firmware itself waits for the finger, nothing to do here. */
 }
 
 /* ------------------------------------------------------------------ */
@@ -667,6 +1261,8 @@ fpi_device_fpcusb_init (FpiDeviceFpcUsb *self)
 {
   self->width = 192;
   self->height = 192;
+  self->threshold = FPC_MATCH_THRESHOLD_DEFAULT;
+  fpc_match_default_params (&self->match_params, self->width, self->height);
 }
 
 static void
@@ -674,8 +1270,9 @@ fpi_device_fpcusb_finalize (GObject *object)
 {
   FpiDeviceFpcUsb *self = FPI_DEVICE_FPCUSB (object);
 
-  g_clear_object (&self->cancellable);
   g_clear_pointer (&self->frame, g_free);
+  g_clear_pointer (&self->enroll_frames, g_free);
+  g_clear_pointer (&self->dump_dir, g_free);
   G_OBJECT_CLASS (fpi_device_fpcusb_parent_class)->finalize (object);
 }
 
@@ -683,7 +1280,6 @@ static void
 fpi_device_fpcusb_class_init (FpiDeviceFpcUsbClass *klass)
 {
   FpDeviceClass *dev_class = FP_DEVICE_CLASS (klass);
-  FpImageDeviceClass *img_class = FP_IMAGE_DEVICE_CLASS (klass);
 
   G_OBJECT_CLASS (klass)->finalize = fpi_device_fpcusb_finalize;
 
@@ -693,22 +1289,17 @@ fpi_device_fpcusb_class_init (FpiDeviceFpcUsbClass *klass)
   dev_class->id_table = id_table;
   dev_class->scan_type = FP_SCAN_TYPE_PRESS;
 
-  /* One press covers so little of the finger that the five samples of
-   * the default enrolment hardly ever overlap with the finger position
-   * of a later verification. */
-  dev_class->nr_enroll_stages = 10;
+  /* One press covers so little of the finger that a verification easily
+   * touches an area no enrolment press ever saw; the template therefore
+   * collects many frames. */
+  dev_class->nr_enroll_stages = FPCUSB_ENROLL_STAGES;
 
-  img_class->img_open = fpcusb_open;
-  img_class->img_close = fpcusb_close;
-  img_class->activate = fpcusb_activate;
-  img_class->deactivate = fpcusb_deactivate;
-  img_class->change_state = fpcusb_change_state;
+  dev_class->open = fpcusb_open;
+  dev_class->close = fpcusb_close;
+  dev_class->enroll = fpcusb_enroll;
+  dev_class->verify = fpcusb_verify;
+  dev_class->identify = fpcusb_identify;
+  dev_class->cancel = fpcusb_cancel;
 
-  /* The geometry depends on the sensor and is learned at open time. */
-  img_class->img_width = -1;
-  img_class->img_height = -1;
-
-  /* A press of this sensor yields a handful of minutiae, which scores
-   * far below what a full sized sensor reaches; 25 is never met. */
-  img_class->bz3_threshold = 20;
+  fpi_device_class_auto_initialize_features (dev_class);
 }
