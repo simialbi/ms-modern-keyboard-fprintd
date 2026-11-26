@@ -1,0 +1,7 @@
+build/
+stage/
+*.o
+*.pgm
+
+# the Windows installer this driver was reverse engineered from
+*.exe

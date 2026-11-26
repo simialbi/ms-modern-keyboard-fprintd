@@ -1,0 +1,192 @@
+name: CI
+
+# Build the userspace driver and run the offline protocol checks on every
+# push, every pull request and once a week (to catch distro/toolchain drift).
+on:
+  push:
+    branches: ['**']
+    tags-ignore: ['**']
+  pull_request:
+  schedule:
+    - cron: '0 5 * * 1'
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+jobs:
+  build:
+    name: build (${{ matrix.os }}, ${{ matrix.cc }})
+    runs-on: ${{ matrix.os }}
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-24.04, ubuntu-22.04]
+        cc: [gcc, clang]
+    env:
+      CC: ${{ matrix.cc }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential clang pkg-config libusb-1.0-0-dev
+
+      - name: Build
+        run: make CC=$CC
+
+      - name: Run offline protocol tests
+        run: make test CC=$CC
+
+      - name: Smoke test the CLI (no hardware required)
+        run: |
+          # Without a keyboard attached the tool must fail gracefully
+          # instead of crashing; usage errors exit with 2, "no device" with 1.
+          set +e
+          ./build/fpc-capture --help
+          rc=$?
+          set -e
+          test "$rc" = "2" || { echo "unexpected usage exit code $rc"; exit 1; }
+          set +e
+          ./build/fpc-capture info
+          rc=$?
+          set -e
+          test "$rc" = "1" || { echo "unexpected exit code $rc without hardware"; exit 1; }
+
+      - name: Check install/uninstall into a staging dir
+        run: |
+          make install DESTDIR="$PWD/stage" PREFIX=/usr CC=$CC
+          test -x stage/usr/bin/fpc-capture
+          test -f stage/etc/udev/rules.d/60-fpc-keyboard.rules
+          make uninstall DESTDIR="$PWD/stage" PREFIX=/usr
+          test ! -e stage/usr/bin/fpc-capture
+
+      - name: Upload binary
+        if: matrix.os == 'ubuntu-24.04' && matrix.cc == 'gcc'
+        uses: actions/upload-artifact@v4
+        with:
+          name: fpc-capture-${{ matrix.os }}-${{ matrix.cc }}
+          path: build/fpc-capture
+          if-no-files-found: error
+
+  sanitizers:
+    name: tests with ASan/UBSan
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libusb-1.0-0-dev
+
+      - name: Build and run tests instrumented
+        env:
+          UBSAN_OPTIONS: print_stacktrace=1:halt_on_error=1
+          ASAN_OPTIONS: detect_leaks=1
+        run: |
+          make clean
+          make test \
+            EXTRA_CFLAGS="-fno-omit-frame-pointer -fsanitize=address,undefined" \
+            EXTRA_LDLIBS="-fsanitize=address,undefined"
+
+  static-analysis:
+    name: static analysis
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install tools
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential pkg-config libusb-1.0-0-dev cppcheck clang-tools
+
+      # Informational: cppcheck versions differ between runners, so a new
+      # finding should not break the build.
+      - name: cppcheck
+        continue-on-error: true
+        run: |
+          cppcheck --std=c11 --enable=warning,performance,portability \
+            --inline-suppr --suppress=missingIncludeSystem \
+            -I src src tests
+
+      # Blocking: the tree is clean under the clang analyzer today.
+      - name: clang static analyzer
+        run: |
+          make clean
+          scan-build --status-bugs make
+
+  udev-rule:
+    name: udev rule syntax
+    runs-on: ubuntu-24.04
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Verify the rule file
+        run: |
+          # udevadm verify exists since systemd 251 (Ubuntu 24.04);
+          # on older runners the step is skipped by the version check.
+          if udevadm verify --help >/dev/null 2>&1; then
+            # --resolve-names=never: the "plugdev" group does not have to
+            # exist on the machine that checks the rule.
+            udevadm verify --resolve-names=never udev/60-fpc-keyboard.rules
+          else
+            echo "udevadm verify not available, skipping"
+          fi
+
+  libfprint-driver:
+    name: libfprint driver (upstream build)
+    runs-on: ubuntu-24.04
+    # The libfprint driver can only be compiled inside a libfprint checkout.
+    # Upstream moves fast, so a failure here does not block the main build.
+    continue-on-error: true
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          path: driver
+
+      - name: Install libfprint build dependencies
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y --no-install-recommends \
+            build-essential meson ninja-build pkg-config git \
+            libusb-1.0-0-dev libglib2.0-dev libgusb-dev libgirepository1.0-dev \
+            libcairo2-dev libgudev-1.0-dev libpixman-1-dev libnss3-dev \
+            libopencv-dev gtk-doc-tools python3-cairo-dev valac
+
+      - name: Clone libfprint
+        run: git clone --depth 1 https://gitlab.freedesktop.org/libfprint/libfprint.git
+
+      - name: Add the fpcusb driver to the tree
+        run: |
+          cp driver/libfprint/fpcusb.c driver/libfprint/fpcusb.h \
+             libfprint/libfprint/drivers/
+          python3 - <<'PY'
+          import re, pathlib
+          p = pathlib.Path('libfprint/libfprint/meson.build')
+          s = p.read_text()
+          if 'fpcusb' not in s:
+              # register the driver in the image-driver source list
+              s = s.replace("drivers_sources = [", "drivers_sources = [\n    'drivers/fpcusb.c',", 1)
+              p.write_text(s)
+          q = pathlib.Path('libfprint/meson_options.txt')
+          t = q.read_text()
+          if 'fpcusb' not in t:
+              t = re.sub(r"(choices:\s*\[)", r"\1'fpcusb', ", t, count=1)
+              q.write_text(t)
+          PY
+
+      - name: Configure and build
+        working-directory: libfprint
+        run: |
+          meson setup _build -Ddrivers=fpcusb -Dintrospection=false \
+            -Dgtk-examples=false -Ddoc=false
+          ninja -C _build

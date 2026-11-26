@@ -1,0 +1,22 @@
+# Microsoft Modern Keyboard with Fingerprint ID - FPC fingerprint sensor.
+#
+# Gives the locally logged in user access to the vendor interface so that
+# fpc-capture (and libfprint built with the fpcusb driver) can claim it.
+#
+# Install:
+#   sudo cp 60-fpc-keyboard.rules /etc/udev/rules.d/
+#   sudo udevadm control --reload && sudo udevadm trigger
+#
+# Replug the keyboard afterwards.
+
+ACTION!="add|change", GOTO="fpc_end"
+SUBSYSTEM!="usb", GOTO="fpc_end"
+
+ATTRS{idVendor}=="045e", ATTRS{idProduct}=="0815", \
+    ENV{LIBFPRINT_DRIVER}="fpcusb", TAG+="uaccess", MODE="0660", \
+    GROUP="plugdev"
+ATTRS{idVendor}=="045e", ATTRS{idProduct}=="0816", \
+    ENV{LIBFPRINT_DRIVER}="fpcusb", TAG+="uaccess", MODE="0660", \
+    GROUP="plugdev"
+
+LABEL="fpc_end"

@@ -1,0 +1,9 @@
+version: 2
+updates:
+  # Keep the actions used by .github/workflows/ci.yml up to date.
+  - package-ecosystem: github-actions
+    directory: /
+    schedule:
+      interval: monthly
+    commit-message:
+      prefix: ci
