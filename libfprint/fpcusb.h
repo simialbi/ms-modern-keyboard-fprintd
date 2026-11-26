@@ -26,4 +26,8 @@ G_DECLARE_FINAL_TYPE (FpiDeviceFpcUsb, fpi_device_fpcusb, FPI, DEVICE_FPCUSB,
 #define FPCUSB_CMD_ABORT   0x0008
 #define FPCUSB_CMD_ERROR   0x000f
 
+/* Status word of a 0x1007 answer that carries no image: the firmware
+ * answers every GET_IMAGE, and this is its "no finger right now". */
+#define FPCUSB_IMG_STATUS_NO_IMAGE 0x0003
+
 #define FPCUSB_DPI         508

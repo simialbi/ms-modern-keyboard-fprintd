@@ -47,6 +47,10 @@ extern "C" {
 #define FPC_CMD_ABORT           0x0008  /* cancel a pending GET_IMAGE         */
 #define FPC_CMD_ERROR           0x000f  /* device -> host error notification  */
 
+/* Status word of a 0x1007 answer that carries no image.  Seen when a
+ * second GET_IMAGE reaches the firmware while one is still pending. */
+#define FPC_IMG_STATUS_NO_IMAGE 0x0003
+
 /* Sensor hardware ids as reported by the HELLO response. */
 #define FPC_HWID_1020           0x0200  /* mask 0xfff0 */
 #define FPC_HWID_1021           0x0210  /* mask 0xfff0 */
@@ -59,9 +63,14 @@ extern "C" {
 
 /* The firmware answers GET_IMAGE only when a finger is on the sensor at
  * the moment the command arrives, and needs about 300 ms to scan it.  A
- * capture is therefore a poll: one ABORT + GET_IMAGE attempt of this
- * length after the other. */
+ * capture is therefore a poll: one GET_IMAGE attempt of this length
+ * after the other, with no ABORT in between. */
 #define FPC_CAPTURE_ATTEMPT_MS  600
+
+/* Pause between two attempts.  The Windows driver sleeps 15 ms after
+ * cancelling its own pending read and before the next GET_IMAGE; a
+ * longer gap loses quick touches. */
+#define FPC_CAPTURE_GAP_MS      15
 
 /* How many attempts in a row have to come back empty before the finger
  * counts as lifted. */
@@ -120,7 +129,9 @@ int  fpc_hello(fpc_dev *dev, fpc_sensor_info *info);
  * is kept for other sensors only - do not use it to detect a finger. */
 int  fpc_status(fpc_dev *dev, uint16_t *value);
 
-/* Cancel a pending capture.  Safe to call from another thread. */
+/* Cancel a pending capture (sends ABORT).  Safe to call from another
+ * thread.  Do not use it to re-arm a poll loop: the Windows driver only
+ * ever sends ABORT for a genuine cancellation. */
 int  fpc_abort(fpc_dev *dev, unsigned timeout_ms);
 
 /* Capture one image.  `buf` must hold width*height bytes (8 bit grey).

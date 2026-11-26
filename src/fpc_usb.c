@@ -393,9 +393,10 @@ int fpc_status(fpc_dev *d, uint16_t *value)
 }
 
 /*
- * Tell the firmware to drop a pending GET_IMAGE.  Used both by
- * fpc_abort() and before every poll attempt, so it must not touch the
- * cancel flag - that one means "the caller wants to stop".
+ * Tell the firmware to drop a pending GET_IMAGE.  Only the caller-facing
+ * fpc_abort() and the error paths use it; the poll loop must not, see
+ * fpc_capture().  It does not touch the cancel flag - that one means
+ * "the caller wants to stop".
  */
 static int abort_cmd(fpc_dev *d, unsigned timeout_ms)
 {
@@ -482,7 +483,10 @@ static int capture_once(fpc_dev *d, uint8_t *img, size_t len,
 	}
 	if (get16(pkt + 2) != 0) {
 		trace(d, 1, "capture: status 0x%04x", get16(pkt + 2));
-		r = FPC_ERR_DEVICE;
+		/* 0x0003 is the firmware's "no image for you this round" and
+		 * must not end the poll. */
+		r = get16(pkt + 2) == FPC_IMG_STATUS_NO_IMAGE
+				? FPC_ERR_TIMEOUT : FPC_ERR_DEVICE;
 		goto out;
 	}
 	if (get16(pkt + 4) != (uint16_t)len)
@@ -535,11 +539,17 @@ out:
 /*
  * Poll the sensor until it hands out an image.
  *
- * Every attempt is a fresh ABORT + GET_IMAGE pair with a short deadline:
- * if a finger is on the sensor the image arrives within roughly 300 ms,
- * otherwise the attempt expires and the next one is sent.  Without this
+ * Every attempt is a GET_IMAGE with a short deadline: if a finger is on
+ * the sensor the image arrives within roughly 300 ms, otherwise the
+ * attempt expires and the next one is sent.  Without the short deadline
  * the first GET_IMAGE after a touch returns the image of the *previous*
  * touch, which made every verification compare the wrong frame.
+ *
+ * No ABORT is sent between two attempts.  The Windows driver cancels
+ * only its own pending read and sends the next GET_IMAGE 15 ms later;
+ * it reserves opcode 0x0008 for a real cancellation.  Our former abort
+ * per attempt meant thousands of them per session, and the imaging
+ * engine stops answering GET_IMAGE for good after a few dozen captures.
  */
 int fpc_capture(fpc_dev *d, uint8_t *img, size_t len, unsigned timeout_ms)
 {
@@ -552,16 +562,9 @@ int fpc_capture(fpc_dev *d, uint8_t *img, size_t len, unsigned timeout_ms)
 	d->cancel = 0;
 
 	for (;;) {
-		/*
-		 * Keep the gap between two attempts short, a touch that
-		 * falls into it is lost: only resynchronise when the
-		 * firmware did not answer the abort as expected.
-		 */
-		if (abort_cmd(d, 500) != FPC_OK)
-			drain(d);
 		if (d->cancel)
 			return FPC_ERR_ABORTED;
-		msleep(5);
+		msleep(FPC_CAPTURE_GAP_MS);
 
 		r = capture_once(d, img, len, FPC_CAPTURE_ATTEMPT_MS);
 		if (r == FPC_OK)
@@ -571,6 +574,9 @@ int fpc_capture(fpc_dev *d, uint8_t *img, size_t len, unsigned timeout_ms)
 		if (r != FPC_ERR_TIMEOUT && r != FPC_ERR_ABORTED &&
 		    r != FPC_ERR_PROTO)
 			return r;
+		/* Only a confused pipe needs resynchronising. */
+		if (r == FPC_ERR_PROTO)
+			drain(d);
 
 		waited += FPC_CAPTURE_ATTEMPT_MS;
 		if (timeout_ms && waited >= timeout_ms)
@@ -604,14 +610,14 @@ int fpc_wait_finger_off(fpc_dev *d, unsigned timeout_ms)
 	while (quiet < FPC_FINGER_OFF_ATTEMPTS) {
 		int r;
 
-		if (abort_cmd(d, 500) != FPC_OK)
-			drain(d);
 		if (d->cancel)
 			break;
-		msleep(5);
+		msleep(FPC_CAPTURE_GAP_MS);
 
 		r = capture_once(d, img, len, FPC_CAPTURE_ATTEMPT_MS);
 		quiet = (r == FPC_OK) ? 0 : quiet + 1;
+		if (r == FPC_ERR_PROTO)
+			drain(d);
 
 		waited += FPC_CAPTURE_ATTEMPT_MS;
 		if (timeout_ms && waited >= timeout_ms)

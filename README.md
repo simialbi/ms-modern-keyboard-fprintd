@@ -39,9 +39,9 @@ driver for libfprint so that `fprintd`, GNOME/KDE settings, PAM login and
 | CRC implementation | verified against the CRC-16/CCITT-FALSE reference vector |
 | Sensor identification on hardware | **working** — FPC1022, hwid `0x0121`, 112 × 88 |
 | Live image capture on hardware | **working** — complete frame, CRC/id/sequence all valid, recognisable ridges |
-| libfprint driver | **working** — a plain `FpDevice` with its own enrol/verify/identify, builds into libfprint |
-| Matching quality | **implemented, thinly calibrated** — multi-frame correlation instead of NBIS; FAR/FRR measured on one person only, see [Matching quality](#matching-quality) |
-| Capture reliability | **partly solved** — the sensor has to be polled; it still wedges after a few hundred cycles, see [`docs/PROTOCOL.md`](docs/PROTOCOL.md) §4.2 |
+| libfprint driver | **working** — a plain `FpDevice` with its own enrol/verify/identify; `fprintd-enroll` completes all 12 stages and `fprintd-verify` reports `verify-match` on hardware |
+| Matching quality | **works, thinly calibrated** — multi-frame correlation instead of NBIS; the genuine finger verifies on hardware, FAR/FRR measured on one person only, see [Matching quality](#matching-quality) |
+| Capture reliability | **much improved** — the per-attempt `ABORT` was the problem; without it the firmware answers every request (status `0x0003` = no finger) and 1841 consecutive polls ran without an error, see [`docs/PROTOCOL.md`](docs/PROTOCOL.md) §4.2 |
 
 Verified against a real keyboard (`045e:0815`, bcdDevice 1.13):
 
@@ -49,8 +49,6 @@ Verified against a real keyboard (`045e:0815`, bcdDevice 1.13):
 fpc: -> cmd 0x0001 id 0x2f9f seq 0x0616
 fpc: <- rsp 0x1001 status 0x0000 seq 0x0617
 fpc: sensor FPC1022 hwid 0x0121 112x88
-fpc: -> cmd 0x0008 id 0x2f9f seq 0x0618      (abort a stale transfer)
-fpc: <- rsp 0x1008 status 0x0000 seq 0x0619
 fpc: -> cmd 0x0007 id 0x2f9f seq 0x061a      (get image)
 fpc: <- rsp 0x1007 status 0x0000 seq 0x061b
 wrote /tmp/finger.pgm
@@ -314,6 +312,14 @@ How to enrol so that verification actually works:
 * use the part of the fingertip you actually put on the key when logging
   in.
 
+A press the firmware does not answer **never ends the enrolment**: it is
+reported as `enroll-retry-scan` and the driver keeps waiting for the next
+one, so you can take as long as you like.  Only if the imaging engine
+stops answering *although it answered before* does the driver intervene —
+it re-runs the `HELLO` handshake, then a USB reset, and gives up with the
+"unplug the keyboard" message after three futile attempts (see
+[`docs/PROTOCOL.md`](docs/PROTOCOL.md) §4.2).
+
 This is necessary because the window is so small: same finger/same spot
 scores ≈ 0.97, a different finger ≤ 0.33, but the same finger on a
 *different* spot only ≈ 0.17.  A single stored frame can therefore never
@@ -431,11 +437,13 @@ id table, the error handling — are in [`docs/PROTOCOL.md`](docs/PROTOCOL.md).
 | `open: USB I/O error` | no permission for `/dev/bus/usb/...`; install the udev rule or use `sudo` |
 | `open: interface busy` | another process (e.g. `fprintd`) holds the interface — stop it first |
 | `hello: protocol error` | the firmware is out of sync; unplug/replug the keyboard |
-| capture never returns | it polls for a finger; press the fingerprint key and **hold it for ~2 s**, brief taps fall between two requests |
-| no image at all any more, `info` still works | the imaging engine is wedged — unplug and replug the keyboard; a USB reset does not help (see [`docs/PROTOCOL.md`](docs/PROTOCOL.md) §4.2) |
+| capture never returns | it polls for a finger; press the fingerprint key and **hold it for ~1 s**, very brief taps can still fall between two requests |
+| no image at all any more, `info` still works | the imaging engine is wedged — un- and rebind the device (`/sys/bus/usb/drivers/usb/{unbind,bind}`, wait 5 s); a USB reset, a pipe reset, re-selecting the interface and even a replug have all been seen to fail (see [`docs/PROTOCOL.md`](docs/PROTOCOL.md) §4.2) |
 | `verify-no-match` for your own finger | the press hit an area the twelve enrolment presses never covered — re-enrol and move the finger around, or lower `FPCUSB_THRESHOLD` while debugging |
 | `verify-retry-scan` | too little skin on the sensor, press flatter and hold ~2 s |
-| `enroll-retry-scan` / `enroll-remove-and-retry` | the press was empty or identical to a previous one; lift the finger and place it slightly differently |
+| `enroll-retry-scan` | nothing arrived within 30 s — press the key and hold it for ~2 s; the stage is simply repeated |
+| `enroll-finger-not-centered` / `enroll-remove-and-retry` | the press was empty or identical to a previous one; lift the finger and place it slightly differently |
+| enrolment ends with "unplug the keyboard and plug it back in" | the imaging engine wedged mid-enrolment and three re-initialisation attempts failed; replug and enrol again |
 | `verify`/`enroll` fails with "please delete it and enrol again" | the stored template predates this driver or came from another sensor — `fprintd-delete "$USER"` and enrol again |
 
 Useful debugging: `fpc-capture -vv`, and `sudo modprobe usbmon` +

@@ -113,13 +113,14 @@ bit-by-bit implementation.
 | op | name | request | response |
 | --- | --- | --- | --- |
 | `0x0001` | `HELLO` / identify | 8 bytes | 12 bytes, payload = 2 byte hardware id |
-| `0x0005` | `STATUS` | 2 bytes (**no** id/seq/crc) | 4 bytes: `0x1005`, value |
+| `0x0005` | `STATUS` | 8 bytes | 10 bytes, no payload — never sent by the Windows driver, see §6 |
 | `0x0007` | `GET_IMAGE` | 8 bytes | `len + 12` bytes, see below |
 | `0x0008` | `ABORT` | 8 bytes | 10 bytes, no payload |
 | `0x000F` | `ERROR` | sent **by the device**, host answers with `0x100F` | — |
 
-`0x0005` is the only command that is sent as a bare 2 byte opcode without
-the id/sequence/CRC trailer.
+Every request uses the same 8 byte framing; `0x0005` was initially
+believed to be a bare 2 byte opcode, but the firmware answers it only in
+the regular form.
 
 ### 4.1 HELLO and sensor identification
 
@@ -168,29 +169,65 @@ the keyboard, 2025-11):
 
 * if a finger rests on the sensor when `GET_IMAGE` arrives, the first
   packet appears after roughly 300 ms,
-* if the sensor is free, the command is simply *never* answered — not
-  with an error, not later when the user touches.  A transfer that was
-  submitted before the touch stays pending forever, and the next
-  `GET_IMAGE` then returns the image of the *previous* touch.
+* if the sensor is free, the firmware answers the request with a
+  `0x1007` frame carrying **status `0x0003`** and no payload — "no image
+  for you".  The answer arrives within a few tens of milliseconds.
+* a request is *not* remembered: a transfer left waiting for 35 s was
+  not completed by a later touch (verified 2025-11-26 on a healthy
+  engine).
 
-Waiting for a finger is therefore a **poll**: `ABORT` + `GET_IMAGE` with
-a deadline of about 600 ms, over and over (`FPC_CAPTURE_ATTEMPT_MS`).
-Shorter attempts do not work - 350 ms missed every single touch in a
-test of ten.  A touch has to overlap the moment a request is sent, so
-brief taps are lost; about 80 % of touches held for ~2 s are caught.
+Waiting for a finger is therefore a **poll**: `GET_IMAGE`, read the
+answer, repeat after 15 ms (`FPC_CAPTURE_GAP_MS`); the read deadline of
+600 ms (`FPC_CAPTURE_ATTEMPT_MS`) only guards against a firmware that
+stopped answering.  In practice a poll cycle costs about 43 ms, and 8 of
+13 one-second presses were caught in a 1841-poll run.
+
+**No `ABORT` is sent between two attempts.**  Re-reading the Windows
+driver (2025-11) showed that it cancels only its *own* pending read
+(`WinUsb`-level cancel, invisible on the wire), sleeps 15 ms and sends
+the next `GET_IMAGE`; opcode `0x0008` goes out only for a genuine
+cancellation.  The earlier poll loop here sent one `ABORT` per attempt —
+thousands per session — and that had two effects: the `0x1008` answers
+hid the `0x0003` frames (which is why the firmware looked silent and why
+a 600 ms deadline per attempt seemed necessary), and the imaging engine
+stopped answering for good after a few hundred cycles.  Without the
+abort, 1841 consecutive polls ran without a single error.
 
 While a finger keeps resting, *every* attempt returns an image, which is
-how `fpc_wait_finger_off()` detects that the finger has been lifted: two
-attempts in a row without an image.
+how a lift is detected: the answer switches back to status `0x0003`
+(`fpc_wait_finger_off()` requires two such attempts in a row, the driver
+stops at the first).
 
-**Known unsolved problem — the imaging engine wedges.**  After a few
-hundred poll cycles the sensor stops delivering images altogether: it
-still answers `HELLO` (`fpc-capture info` works), but every `GET_IMAGE`
-runs into its deadline, for any finger.  `libusb_reset_device()` does
-*not* recover it; only unplugging the keyboard does, and even then the
-next capture may be the last one for a while.  Whatever the Windows
-driver does to keep the engine alive (a calibration command among the
-undocumented opcodes `0x0002`-`0x0006`?) is still unknown.
+**The imaging engine can wedge.**  It then stops delivering images
+altogether: it still answers `HELLO` (`fpc-capture info` works, status
+0, correct hwid), but every `GET_IMAGE` runs into its deadline without
+any answer at all, for any finger and also for a request that is left
+waiting without any polling.
+`libusb_reset_device()`, `libusb_clear_halt()` on both endpoints and
+re-selecting the alternate setting all succeed and change nothing, and
+on 2025-11-26 even a physical replug did not bring the engine back.
+What *did* revive it is a **full logical re-enumeration** of the device
+from the host:
+
+```sh
+echo -n 1-2.3.3 | sudo tee /sys/bus/usb/drivers/usb/unbind
+sleep 5
+echo -n 1-2.3.3 | sudo tee /sys/bus/usb/drivers/usb/bind
+```
+
+(the port id comes from `lsusb -t`; give it at least five seconds to
+come back).  Since removing the per-attempt `ABORT` the wedge has not
+been reproduced.
+
+There is **no hidden vendor command** that could be missing: the Windows
+driver only ever sends `HELLO`, `GET_IMAGE`, `ABORT` and the `0x100F`
+acknowledgement (six CRC call sites in
+`KeyboardFingerprintDriver.dll`), has no WinUSB control transfers, no
+pipe reset and no recovery path of its own.  The opcodes `0x0002`-`0x0006`
+are never used by it, and `0x0005` is the only one this firmware answers
+at all (with a bare 10-byte acknowledgement, see §6).  The one
+difference that remained was the per-attempt `ABORT` described above,
+which is why it was removed.
 
 #### How the drivers poll
 
@@ -208,41 +245,67 @@ in *when* they poll:
 
 #### Recovery sequence of the libfprint driver
 
-A command transfer (`ABORT`/`GET_IMAGE`) that fails is the symptom of the
-wedge; a *timeout while reading the image* is not, it only means "no
-finger yet".  After eight consecutive command failures in one operation
-the driver, in this order:
+A single fruitless poll means nothing — the user simply has not touched
+the sensor yet.  The driver therefore treats two situations as a wedge:
+
+* eight consecutive failures of a `GET_IMAGE` command transfer, and
+* thirty consecutive polls without an image **after the engine has
+  already delivered at least one image during this operation** — that is
+  exactly the "it worked and then stopped" signature, and it is what
+  breaks an enrolment in the middle.
+
+In both cases the driver, in this order:
 
 1. re-runs the `HELLO` handshake (up to 20 attempts, 200 ms apart) and
    resumes the capture if the sensor answers again,
-2. otherwise issues a USB port reset (`g_usb_device_reset()`),
-3. and finally fails the operation with `FP_DEVICE_ERROR_PROTO` and the
-   message that the keyboard has to be unplugged and plugged back in.
+2. and after three such attempts without a single image in between fails
+   the operation with `FP_DEVICE_ERROR_PROTO` and the message that the
+   device has to be re-bound or the keyboard replugged.
 
-Step 2 is known not to help on this firmware; it is kept because it is
-the last thing the host can try before the user has to act, and the
-explicit error is what turns a hang into something actionable.
+A successful capture resets the attempt counter, so a user who takes a
+long break between two presses never runs into step 2.
+
+The driver deliberately does **not** call `g_usb_device_reset()`: it
+never revived the engine in any measurement, and it makes the kernel
+re-enumerate the keyboard, which fprintd reports as
+`enroll-disconnected` in the middle of a run.
+
+#### Keeping the pipe in sync
+
+A read that ran into its deadline while the firmware answered late
+leaves that answer in the input pipe, and every following frame is then
+read one answer too early - observed as `bad crc` and, in one run, as a
+stale `0x1001` HELLO reply in place of an image header.  Whenever a
+frame cannot be used (deadline, unexpected opcode, short or truncated
+packet, failing CRC) the driver therefore reads the pipe empty
+(`CAPTURE_DRAIN`, 60 ms per read) before sending the next `GET_IMAGE`,
+and counts the round as an empty poll instead of failing the operation.
+`src/fpc_usb.c` does the same with `drain()`.
+
+Everything else that merely produced no usable image — a poll deadline, a
+`0x1008` abort frame in place of the image, an unsolicited `0x000F` — is
+a *retry*, not a failure: during an enrolment it is reported with
+`fpi_device_enroll_progress()` and the same stage is attempted again, so
+the run continues.  fprintd shows this as a non-final
+`enroll-retry-scan`.  Completing the enrolment with such an error would
+abort the whole run, which is what fprintd prints as a final
+`enroll-retry-scan` after the stages passed so far.
 
 ### 4.3 Cancelling
 
 A pending `GET_IMAGE` is cancelled by sending `0x0008`.  The device then
 answers the *outstanding* read with a `0x1008` frame instead of image
 data, which is how both the Windows driver and this port break out of the
-blocking wait.  The Windows driver always sends an `ABORT` before a new
-`GET_IMAGE` to make sure the firmware is idle.
+blocking wait.
 
-Two different aborts are therefore needed, and mixing them up breaks the
-poll loop:
+`0x0008` is reserved for exactly that: interrupting a running operation
+(`fpc_abort()`, the `cancel` callback of the driver).  fprintd uses it
+for its own timeout and for Ctrl-C.  A `0x1008` arriving in place of
+image data is treated as "no image this round", so a cancelled verify
+leaves the device immediately usable.
 
-* the **internal** abort that every poll attempt sends before its
-  `GET_IMAGE` (`abort_cmd()` in `src/fpc_usb.c`, state
-  `CAPTURE_SEND_ABORT` in the driver).  Its answer is read and discarded;
-  the input pipe is only drained when that handshake itself fails.
-* the **caller facing** abort that interrupts a running operation
-  (`fpc_abort()`, the `cancel` callback of the driver).  fprintd uses it
-  for its own timeout and for Ctrl-C; a `0x1008` arriving in place of
-  image data is treated as "no image this round", so a cancelled verify
-  leaves the device immediately usable.
+The poll loop itself must **not** use it (see 4.2); the input pipe is
+only drained when a frame could not be parsed at all.
 
 ### 4.4 Error notifications
 
@@ -288,9 +351,11 @@ The Windows stack also contains:
 
 ## 6. Notes for anyone extending this
 
-* The sensor does **not** provide a separate "finger present" interrupt,
-  and `STATUS` (`0x0005`) is stalled by this firmware, so it cannot be
-  used for finger detection either.  Waiting for a finger means polling
+* The sensor does **not** provide a separate "finger present" interrupt.
+  `STATUS` (`0x0005`) does answer when it is sent as a normal 8-byte
+  frame and nothing else is in flight, but the answer is a bare
+  acknowledgement that does not change while a finger is on the sensor —
+  and the Windows driver never sends it.  Waiting for a finger means polling
   `GET_IMAGE`, see 4.2 — a transfer submitted *before* the touch is never
   completed, so the libfprint driver must not wait on a single one.
 * The HID keyboard interface (interface 0) is untouched — the keyboard
