@@ -31,8 +31,13 @@ struct _FpiDeviceFpcUsb
   gsize         frame_len;
   gsize         frame_off;
 
+  guint         hello_tries;
+  GCancellable *cancellable;    /* cancels the pending image transfer  */
   gboolean      deactivating;
 };
+
+/* The sensor ignores the first commands after it has been powered on. */
+#define FPCUSB_HELLO_TRIES 20
 
 G_DEFINE_TYPE (FpiDeviceFpcUsb, fpi_device_fpcusb, FP_TYPE_IMAGE_DEVICE)
 
@@ -103,6 +108,30 @@ fpcusb_cmd_transfer (FpDevice *dev, FpiDeviceFpcUsb *self, guint16 op)
   return t;
 }
 
+/* Transfers whose outcome does not matter still need a callback. */
+static void
+fpcusb_ignore_cb (FpiUsbTransfer *transfer, FpDevice *dev,
+                  gpointer user_data, GError *error)
+{
+  g_clear_error (&error);
+}
+
+/* Acknowledge an unsolicited error frame (0x000f) with 0x100f. */
+static void
+fpcusb_ack_error (FpDevice *dev, FpiDeviceFpcUsb *self)
+{
+  FpiUsbTransfer *t = fpi_usb_transfer_new (dev);
+
+  self->seq++;
+  fpi_usb_transfer_fill_bulk (t, FPCUSB_EP_OUT, 10);
+  put16 (t->buffer + 0, FPCUSB_CMD_ERROR | FPCUSB_RESP);
+  put16 (t->buffer + 2, 0);
+  put16 (t->buffer + 4, self->id);
+  put16 (t->buffer + 6, self->seq);
+  put16 (t->buffer + 8, fpcusb_crc16 (t->buffer, 8));
+  fpi_usb_transfer_submit (t, 1000, NULL, fpcusb_ignore_cb, NULL);
+}
+
 /*
  * Validate a complete response frame:
  *   u16 op|0x1000 | u16 status | payload | u16 id | u16 seq | u16 crc
@@ -159,21 +188,40 @@ open_recv_cb (FpiUsbTransfer *transfer, FpDevice *dev,
 {
   FpiDeviceFpcUsb *self = FPI_DEVICE_FPCUSB (dev);
 
-  if (error)
+  g_autoptr(GError) local_error = error;
+
+  if (!local_error)
     {
-      fpi_ssm_mark_failed (transfer->ssm, error);
-      return;
+      GError *proto_error = NULL;
+
+      if (fpcusb_check (self, transfer->buffer, transfer->actual_length,
+                        FPCUSB_CMD_HELLO, &proto_error))
+        {
+          self->hwid = get16 (transfer->buffer + 4);
+          fpcusb_geometry (self);
+          fpi_ssm_next_state (transfer->ssm);
+          return;
+        }
+      local_error = proto_error;
     }
-  if (!fpcusb_check (self, transfer->buffer, transfer->actual_length,
-                     FPCUSB_CMD_HELLO, &error))
+
+  if (g_error_matches (local_error, G_IO_ERROR, G_IO_ERROR_CANCELLED))
     {
-      fpi_ssm_mark_failed (transfer->ssm, error);
+      fpi_ssm_mark_failed (transfer->ssm, g_steal_pointer (&local_error));
       return;
     }
 
-  self->hwid = get16 (transfer->buffer + 4);
-  fpcusb_geometry (self);
-  fpi_ssm_next_state (transfer->ssm);
+  /* The firmware drops the first commands after power on, exactly like
+   * the Windows driver we retry a couple of times. */
+  if (++self->hello_tries < FPCUSB_HELLO_TRIES)
+    {
+      fp_dbg ("hello attempt %u failed: %s", self->hello_tries,
+              local_error->message);
+      fpi_ssm_jump_to_state_delayed (transfer->ssm, OPEN_SEND_HELLO, 200);
+      return;
+    }
+
+  fpi_ssm_mark_failed (transfer->ssm, g_steal_pointer (&local_error));
 }
 
 static void
@@ -185,9 +233,13 @@ open_run_state (FpiSsm *ssm, FpDevice *dev)
   switch (fpi_ssm_get_cur_state (ssm))
     {
     case OPEN_SEND_HELLO:
-      self->id = (guint16) g_random_int_range (1, G_MAXUINT16);
-      self->seq = (guint16) g_random_int_range (0, 0x7ff);
+      if (self->hello_tries == 0)
+        {
+          self->id = (guint16) g_random_int_range (1, G_MAXUINT16);
+          self->seq = (guint16) g_random_int_range (0, 0x7ff);
+        }
       t = fpcusb_cmd_transfer (dev, self, FPCUSB_CMD_HELLO);
+      t->ssm = ssm;
       fpi_usb_transfer_submit (t, 1000, NULL,
                                fpi_ssm_usb_transfer_cb, NULL);
       break;
@@ -213,6 +265,7 @@ open_done (FpiSsm *ssm, FpDevice *dev, GError *error)
 static void
 fpcusb_open (FpImageDevice *dev)
 {
+  FpiDeviceFpcUsb *self = FPI_DEVICE_FPCUSB (dev);
   GError *error = NULL;
 
   if (!g_usb_device_claim_interface (fpi_device_get_usb_device (FP_DEVICE (dev)),
@@ -221,6 +274,8 @@ fpcusb_open (FpImageDevice *dev)
       fpi_image_device_open_complete (dev, error);
       return;
     }
+
+  self->hello_tries = 0;
 
   fpi_ssm_start (fpi_ssm_new (FP_DEVICE (dev), open_run_state,
                               OPEN_NUM_STATES), open_done);
@@ -241,12 +296,33 @@ fpcusb_close (FpImageDevice *dev)
 /* ------------------------------------------------------------------ */
 
 enum capture_states {
+  CAPTURE_SEND_ABORT,
+  CAPTURE_RECV_ABORT,
   CAPTURE_SEND_CMD,
   CAPTURE_FIRST_PACKET,
   CAPTURE_NEXT_PACKET,
   CAPTURE_FINISH,
   CAPTURE_NUM_STATES,
 };
+
+/*
+ * Every capture starts by cancelling whatever the firmware may still be
+ * doing; the reply to that abort is swallowed here so that the image
+ * transfer starts on a clean pipe (this mirrors fpc-capture).
+ */
+static void
+capture_abort_cb (FpiUsbTransfer *transfer, FpDevice *dev,
+                  gpointer user_data, GError *error)
+{
+  FpiDeviceFpcUsb *self = FPI_DEVICE_FPCUSB (dev);
+
+  g_autoptr(GError) local_error = error;
+
+  if (!local_error && transfer->actual_length >= 10)
+    self->seq = get16 (transfer->buffer + transfer->actual_length - 4);
+
+  fpi_ssm_next_state_delayed (transfer->ssm, 15);
+}
 
 static void
 capture_first_cb (FpiUsbTransfer *transfer, FpDevice *dev,
@@ -269,9 +345,17 @@ capture_first_cb (FpiUsbTransfer *transfer, FpDevice *dev,
     }
 
   op = get16 (transfer->buffer);
-  if (op == (FPCUSB_CMD_ABORT | FPCUSB_RESP) || op == FPCUSB_CMD_ERROR)
+  if (op == FPCUSB_CMD_ERROR || op == (FPCUSB_CMD_ERROR | FPCUSB_RESP))
     {
-      /* aborted or device error: silently restart the capture loop */
+      /* unsolicited error frame: acknowledge it and start over */
+      fpcusb_ack_error (dev, self);
+      fpi_ssm_mark_failed (transfer->ssm,
+                           fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL));
+      return;
+    }
+  if (op == (FPCUSB_CMD_ABORT | FPCUSB_RESP))
+    {
+      /* aborted: silently restart the capture loop */
       fpi_ssm_mark_failed (transfer->ssm,
                            fpi_device_retry_new (FP_DEVICE_RETRY_GENERAL));
       return;
@@ -339,8 +423,30 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
   FpImage *img;
   gsize want;
 
+  if (self->deactivating)
+    {
+      fpi_ssm_mark_failed (ssm, g_error_new_literal (G_IO_ERROR,
+                                                     G_IO_ERROR_CANCELLED,
+                                                     "deactivating"));
+      return;
+    }
+
   switch (fpi_ssm_get_cur_state (ssm))
     {
+    case CAPTURE_SEND_ABORT:
+      self->seq++;
+      t = fpcusb_cmd_transfer (dev, self, FPCUSB_CMD_ABORT);
+      t->ssm = ssm;
+      fpi_usb_transfer_submit (t, 1000, NULL, fpi_ssm_usb_transfer_cb, NULL);
+      break;
+
+    case CAPTURE_RECV_ABORT:
+      t = fpi_usb_transfer_new (dev);
+      t->ssm = ssm;
+      fpi_usb_transfer_fill_bulk (t, FPCUSB_EP_IN, 10);
+      fpi_usb_transfer_submit (t, 500, NULL, capture_abort_cb, NULL);
+      break;
+
     case CAPTURE_SEND_CMD:
       self->frame_len = (gsize) self->width * self->height + 12;
       g_free (self->frame);
@@ -357,7 +463,7 @@ capture_run_state (FpiSsm *ssm, FpDevice *dev)
       t = fpi_usb_transfer_new (dev);
       t->ssm = ssm;
       fpi_usb_transfer_fill_bulk (t, FPCUSB_EP_IN, FPCUSB_PACKET);
-      fpi_usb_transfer_submit (t, 0, fpi_device_get_cancellable (dev),
+      fpi_usb_transfer_submit (t, 0, self->cancellable,
                                capture_first_cb, NULL);
       break;
 
@@ -406,6 +512,13 @@ capture_done (FpiSsm *ssm, FpDevice *dev, GError *error)
       return;
     }
 
+  /* A retry error means "no usable image this time" - just listen again. */
+  if (error && error->domain == FP_DEVICE_RETRY)
+    {
+      fp_dbg ("capture retry: %s", error->message);
+      g_clear_error (&error);
+    }
+
   if (error)
     {
       fpi_image_device_session_error (FP_IMAGE_DEVICE (dev), error);
@@ -427,6 +540,8 @@ fpcusb_activate (FpImageDevice *dev)
   FpiDeviceFpcUsb *self = FPI_DEVICE_FPCUSB (dev);
 
   self->deactivating = FALSE;
+  g_clear_object (&self->cancellable);
+  self->cancellable = g_cancellable_new ();
   fpi_image_device_activate_complete (dev, NULL);
   fpi_ssm_start (fpi_ssm_new (FP_DEVICE (dev), capture_run_state,
                               CAPTURE_NUM_STATES), capture_done);
@@ -444,9 +559,9 @@ fpcusb_deactivate (FpImageDevice *dev)
    * GET_IMAGE with an ABORT frame as soon as opcode 8 arrives. */
   self->seq++;
   t = fpcusb_cmd_transfer (FP_DEVICE (dev), self, FPCUSB_CMD_ABORT);
-  fpi_usb_transfer_submit (t, 1000, NULL, NULL, NULL);
+  fpi_usb_transfer_submit (t, 1000, NULL, fpcusb_ignore_cb, NULL);
 
-  g_cancellable_cancel (fpi_device_get_cancellable (FP_DEVICE (dev)));
+  g_cancellable_cancel (self->cancellable);
 }
 
 static void
@@ -477,6 +592,7 @@ fpi_device_fpcusb_finalize (GObject *object)
 {
   FpiDeviceFpcUsb *self = FPI_DEVICE_FPCUSB (object);
 
+  g_clear_object (&self->cancellable);
   g_clear_pointer (&self->frame, g_free);
   G_OBJECT_CLASS (fpi_device_fpcusb_parent_class)->finalize (object);
 }

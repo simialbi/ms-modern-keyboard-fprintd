@@ -8,15 +8,21 @@
 #   sudo udevadm control --reload && sudo udevadm trigger
 #
 # Replug the keyboard afterwards.
+#
+# Access is granted with TAG+="uaccess": systemd-logind gives the user of
+# the active local session an ACL on the device node.  fprintd runs as
+# root and does not need this, it only matters for fpc-capture.
+#
+# No GROUP= is used on purpose: on distributions without a "plugdev"
+# group (Arch, Fedora, ...) an unknown group makes udev drop the whole
+# rule, which left the device root-only.
 
 ACTION!="add|change", GOTO="fpc_end"
 SUBSYSTEM!="usb", GOTO="fpc_end"
 
 ATTRS{idVendor}=="045e", ATTRS{idProduct}=="0815", \
-    ENV{LIBFPRINT_DRIVER}="fpcusb", TAG+="uaccess", MODE="0660", \
-    GROUP="plugdev"
+    ENV{LIBFPRINT_DRIVER}="fpcusb", TAG+="uaccess", MODE="0660"
 ATTRS{idVendor}=="045e", ATTRS{idProduct}=="0816", \
-    ENV{LIBFPRINT_DRIVER}="fpcusb", TAG+="uaccess", MODE="0660", \
-    GROUP="plugdev"
+    ENV{LIBFPRINT_DRIVER}="fpcusb", TAG+="uaccess", MODE="0660"
 
 LABEL="fpc_end"

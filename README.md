@@ -20,7 +20,8 @@ driver for libfprint so that `fprintd`, GNOME/KDE settings, PAM login and
 │   ├── fpc_usb.h/.c     the driver itself (reusable library)
 │   └── fpc_capture.c    "fpc-capture" command line tool
 ├── libfprint/           driver for the libfprint stack (fprintd, PAM, GNOME)
-│   └── fpcusb.c/.h
+│   ├── fpcusb.c/.h
+│   └── install.sh       rebuilds libfprint with the driver and wires up fprintd
 ├── udev/                access rule for the device node
 ├── tests/               offline self tests of the recovered framing
 ├── .github/workflows/   CI: build, tests, sanitizers, static analysis
@@ -37,7 +38,7 @@ driver for libfprint so that `fprintd`, GNOME/KDE settings, PAM login and
 | CRC implementation | verified against the CRC-16/CCITT-FALSE reference vector |
 | Sensor identification on hardware | **working** — FPC1022, hwid `0x0121`, 112 × 88 |
 | Live image capture on hardware | **working** — complete frame, CRC/id/sequence all valid, recognisable ridges |
-| libfprint driver | written, needs to be built inside a libfprint checkout |
+| libfprint driver | **working** — built into libfprint 1.94.100, `fprintd-enroll` completes on real hardware |
 
 Verified against a real keyboard (`045e:0815`, bcdDevice 1.13):
 
@@ -55,6 +56,23 @@ wrote /tmp/finger.pgm
 The resulting 112 × 88 image contains continuous, coherent ridge lines, so
 the frame reassembly, the row stride and the image geometry are all
 correct.
+
+The libfprint driver was verified the same way, on CachyOS with
+libfprint 1.94.100 and fprintd 1.94.5:
+
+```
+$ fprintd-list $USER
+User <username> has no fingers enrolled for Microsoft Modern Keyboard with Fingerprint ID (FPC).
+$ fprintd-enroll
+Enrolling right-index-finger finger.
+Enroll result: enroll-stage-passed
+...
+Enroll result: enroll-completed
+```
+
+If a second reader is present (a laptop sensor, for example), `fprintd`
+lists both; pick this one with `fprintd-enroll -d /net/reactivated/Fprint/Device/1`
+or whichever device id it reports for the keyboard.
 
 ## Build
 
@@ -147,33 +165,59 @@ kernel.
 ## Using it with fprintd / GNOME / PAM
 
 `libfprint/fpcusb.c` is a driver for libfprint ≥ 1.94 (the stack behind
-`fprintd`, GNOME Settings and `pam_fprintd`):
+`fprintd`, GNOME Settings and `pam_fprintd`).  Since libfprint links its
+drivers statically, the library has to be rebuilt with the driver in it.
+`libfprint/install.sh` does all of that:
 
 ```sh
-git clone https://gitlab.freedesktop.org/libfprint/libfprint
-cd libfprint
-cp /path/to/this/repo/libfprint/fpcusb.c  libfprint/drivers/
-cp /path/to/this/repo/libfprint/fpcusb.h  libfprint/drivers/
+./libfprint/install.sh          # build and install, asks for sudo
+./libfprint/install.sh --help   # options
 ```
 
-Add the driver to the build:
+It
 
-* in `meson_options.txt`, add `'fpcusb'` to the `drivers` option choices,
-* in `libfprint/meson.build`, add `'fpcusb'` to the `drivers` list (the
-  file is picked up as `drivers/fpcusb.c` automatically).
+1. clones libfprint and checks out the version that is installed on the
+   system (falling back to the default branch if that tag cannot be
+   configured with the local meson),
+2. copies `fpcusb.c`/`fpcusb.h` into `libfprint/drivers/` and registers
+   the driver in `meson.build` and `libfprint/meson.build`,
+3. builds and installs into `/usr/local` — the distribution package is
+   left untouched,
+4. installs `udev/60-fpc-keyboard.rules`,
+5. adds `/etc/systemd/system/fprintd.service.d/50-local-libfprint.conf`
+   so that **only** `fprintd` loads the patched library
+   (`LD_LIBRARY_PATH=/usr/local/lib`).
+
+Build requirements beyond the ones above: `git`, `meson`, `ninja`, the
+glib development tools and the libfprint dependencies:
 
 ```sh
-meson setup builddir -Ddrivers=all
-meson compile -C builddir
-sudo meson install -C builddir
+sudo pacman -S git meson glib2-devel libgusb pixman nss openssl libgudev   # Arch
+sudo apt install git meson ninja-build libglib2.0-dev libgusb-dev \
+     libpixman-1-dev libnss3-dev libgudev-1.0-dev                          # Debian
 ```
 
-Then enrol with `fprintd-enroll`, verify with `fprintd-verify`, and enable
-it for login with `pam-auth-update` (Debian/Ubuntu) or by adding
-`auth sufficient pam_fprintd.so` to the relevant PAM stack.
+Afterwards:
 
-For a quick check without installing, libfprint's own
-`examples/img_capture` works against the built tree.
+```sh
+fprintd-list "$USER"   # should report the device ("no prints" is fine)
+fprintd-enroll         # touch the fingerprint key when asked
+fprintd-verify
+```
+
+Enable it for login with `pam-auth-update` (Debian/Ubuntu) or by adding
+`auth sufficient pam_fprintd.so` to the relevant PAM stack (Arch:
+`/etc/pam.d/system-local-login`, `sudo`, …).
+
+Everything can be undone with:
+
+```sh
+./libfprint/install.sh --uninstall
+```
+
+For a quick check without installing, build only
+(`./libfprint/install.sh --build-only`) and run libfprint's own
+`examples/img-capture` from `build/libfprint/_build`.
 
 The driver reports:
 
