@@ -69,7 +69,7 @@ jobs:
 
       - name: Upload binary
         if: matrix.os == 'ubuntu-24.04' && matrix.cc == 'gcc'
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: fpc-capture-${{ matrix.os }}-${{ matrix.cc }}
           path: build/fpc-capture
