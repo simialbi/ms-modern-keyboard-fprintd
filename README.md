@@ -343,20 +343,35 @@ impostor comparisons).  The measured configurations were:
 | 37 × 29 px | ±4° (2 steps) | 12 | 0.1154 (0.648) | 0/26 | 4/26 |
 | 28 × 22 px | ±8° (4 steps) | 12 | 0.1538 (0.614) | 0/26 | 5/26 |
 
-That threshold of 0.80 turned out to be far too strict in practice.
-Measured end to end through `fprintd` on the keyboard (2025-11-26,
-12-frame template, scores from the journal):
+That threshold of 0.80 turned out to be far too strict in practice: the
+evaluator builds its templates from frames of the same capture run,
+which makes genuine scores look better than they are.  What counts is the
+end-to-end measurement through `fprintd` on the keyboard (2025-11-26,
+scores taken from the journal):
 
-| press | scores | at 0.80 | at 0.50 |
-| --- | --- | ---: | ---: |
-| enrolled finger (5×) | 0.493, 0.506, 0.640, 0.723, 0.825 | 1/5 accepted | 5/5 accepted |
-| a finger never enrolled (3×) | 0.315, 0.366, 0.389 | 0/3 accepted | 0/3 accepted |
+| press | scores |
+| --- | --- |
+| enrolled finger, 12-frame template (5× + 1×) | 0.493, 0.506, 0.640, 0.723, 0.825, 0.854 |
+| enrolled finger, 16-frame template (5×) | 0.412, 0.474, 0.658, 0.671, 0.780 |
+| a finger never enrolled (6×) | 0.117, 0.312, 0.315, 0.365, 0.366, 0.389 |
 
-The gap between the two groups is clean (0.389 vs. 0.493), so the shipped
+| threshold | genuine accepted | impostors accepted |
+| ---: | ---: | ---: |
+| 0.80 | 2/11 | 0/6 |
+| 0.50 | 8/11 | 0/6 |
+| **0.45** | **9/11** | **0/6** |
+| 0.40 | 11/11 | 0/6 |
+
+The two groups barely touch (0.389 against 0.412), so the shipped
 defaults are a **16-frame template** (one per enrolment stage), a
 37 × 29 pixel translation window, a ±4° rotation search and a threshold
-of **0.50** (`FPC_MATCH_THRESHOLD_DEFAULT` in `src/fpc_match.h`), which
-sits a little above the impostor side of that gap.
+of **0.45** (`FPC_MATCH_THRESHOLD_DEFAULT` in `src/fpc_match.h`) - low
+enough to accept almost every genuine press, with a little margin left
+on the impostor side.
+
+A rejected press is normal on a sensor this small: press again, slightly
+differently.  The score of the rejected press is in the journal, which
+makes it easy to see whether it was close or nowhere near.
 
 If you want it stricter or more forgiving, pass the override to the
 installer - it ends up in fprintd's systemd drop-in:
@@ -401,7 +416,7 @@ for `fprintd-verify`:
 
 | variable | effect |
 | --- | --- |
-| `FPCUSB_THRESHOLD` | decision threshold, `(0, 1]`, default 0.50 |
+| `FPCUSB_THRESHOLD` | decision threshold, `(0, 1]`, default 0.45 |
 | `FPCUSB_MAX_SHIFT` | translation search radius in pixels, both axes |
 | `FPCUSB_ROT_STEPS` | rotation steps per side (0 disables the rotation search) |
 | `FPCUSB_DUMP_DIR` | write every captured frame there as PGM — **these are fingerprint images** |
