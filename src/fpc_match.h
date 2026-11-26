@@ -18,7 +18,14 @@ extern "C" {
 #define FPC_TPL_VERSION 1
 #define FPC_TPL_MAX_FRAMES 16
 #define FPC_TPL_HEADER_SIZE 14
-#define FPC_MATCH_THRESHOLD_DEFAULT 0.80
+/*
+ * Measured end to end through fprintd on the FPC1022 of the keyboard
+ * (2025-11-26, 12-frame template): the enrolled finger scores
+ * 0.49...0.83, a finger that was never enrolled 0.32...0.39.  0.50 sits
+ * in that gap, a little above the impostor side.  Overridable at run
+ * time with FPCUSB_THRESHOLD.
+ */
+#define FPC_MATCH_THRESHOLD_DEFAULT 0.50
 
 /*
  * Logical template header. The serialized representation is a 14-byte,

@@ -93,7 +93,12 @@ struct _FpiDeviceFpcUsb
 #define FPCUSB_OPERATION_MS 30000
 #define FPCUSB_LIFT_MS      5000
 
-#define FPCUSB_ENROLL_STAGES   12
+/*
+ * Sixteen presses fill the template completely (FPC_TPL_MAX_FRAMES).  The
+ * window is only 5.6 x 4.4 mm, so the number of stored frames is what
+ * decides whether a later press lands on skin the template has seen.
+ */
+#define FPCUSB_ENROLL_STAGES   16
 #define FPCUSB_MIN_COVERAGE    0.10
 #define FPCUSB_DUPLICATE_SCORE 0.95
 
@@ -1210,6 +1215,7 @@ fpcusb_verify_frame (FpDevice *dev, guint8 *frame)
   g_autoptr(GVariant) holder = NULL;
   const guint8 *frames;
   guint count = 0;
+  guint best_frame = 0;
   gdouble score;
 
   /* Not enough skin on the sensor: this is a retry, never a no-match. */
@@ -1229,9 +1235,13 @@ fpcusb_verify_frame (FpDevice *dev, guint8 *frame)
       return;
     }
 
-  score = fpc_match_score_set (frame, frames, count, &self->match_params, NULL);
-  fp_info ("verify score %.3f (threshold %.3f, %u frames, coverage %.2f)",
-           score, self->threshold, count, coverage);
+  score = fpc_match_score_set (frame, frames, count, &self->match_params,
+                               &best_frame);
+  /* Deliberately a warning: libfprint's info level is suppressed by
+   * default, and this number is what a user needs to judge a rejection. */
+  fp_warn ("verify score %.3f (threshold %.3f, best of %u frames: #%u, "
+           "coverage %.2f)", score, self->threshold, count, best_frame,
+           coverage);
 
   fpcusb_operation_reset (self);
   fpi_device_verify_report (dev,
@@ -1286,7 +1296,7 @@ fpcusb_identify_frame (FpDevice *dev, guint8 *frame)
         }
     }
 
-  fp_info ("identify best score %.3f (threshold %.3f)", best_score,
+  fp_warn ("identify best score %.3f (threshold %.3f)", best_score,
            self->threshold);
 
   fpcusb_operation_reset (self);

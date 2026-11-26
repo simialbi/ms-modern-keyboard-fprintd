@@ -305,8 +305,18 @@ $SUDO udevadm trigger --subsystem-match=usb --attr-match=idVendor=045e || true
 
 say "pointing fprintd at $PREFIX/lib"
 $SUDO install -d /etc/systemd/system/fprintd.service.d
-printf '# Added by %s - use the libfprint built with the fpcusb driver.\n[Service]\nEnvironment=LD_LIBRARY_PATH=%s/lib\n' \
-	"$0" "$PREFIX" | $SUDO tee "$DROPIN" >/dev/null
+{
+	printf '# Added by %s - use the libfprint built with the fpcusb driver.\n' "$0"
+	printf '[Service]\nEnvironment=LD_LIBRARY_PATH=%s/lib\n' "$PREFIX"
+	# Pass the driver's tuning overrides on to the daemon, e.g.
+	#   sudo FPCUSB_THRESHOLD=0.45 ./libfprint/install.sh
+	for var in FPCUSB_THRESHOLD FPCUSB_MAX_SHIFT FPCUSB_ROT_STEPS \
+		   FPCUSB_DUMP_DIR; do
+		eval "value=\${$var:-}"
+		[ -n "$value" ] && printf 'Environment=%s=%s\n' "$var" "$value"
+	done
+	true
+} | $SUDO tee "$DROPIN" >/dev/null
 $SUDO systemctl daemon-reload
 $SUDO systemctl stop fprintd.service 2>/dev/null || true
 
